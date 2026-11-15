@@ -69,9 +69,20 @@ palette alpha를 사용합니다. 값을 지정하면 palette alpha 대신 해�
 지원 여부, evidence 출처와 안정된 reason code가 포함됩니다. `heightKind`는
 `ellipsoidal`, `gravity-related/orthometric`, `local/unknown` 중 하나이며
 확실성은 `explicit`, `inferred`, `unknown`으로 표시됩니다.
-두 reader는 첫 WKT VLR을 선택하고, VLR WKT가 없을 때만 첫 WKT EVLR을 사용합니다.
-여러 WKT record 내용이 다르면 `conflicting-source-wkt`를 보고하고 해당 precedence의
-첫 값을 선택된 원본으로 유지합니다.
+두 reader는 LAS `LASF_Projection` user ID와 record ID 2112로 CRS record를 식별합니다.
+유효한 WKT VLR이 있으면 첫 번째 VLR을 선택하고, 없으면 첫 WKT EVLR을 선택합니다.
+기존 WKT record가 `LASF_Spec` record ID 7로 바뀌어 superseded된 경우에는 활성 CRS
+record로 보지 않으므로 대체 EVLR을 선택할 수 있습니다. 선택은 record 식별과 LAS
+supersession 규칙을 따르며, 해석된 WKT 문자열 비교는 conflict를 보고하는 데만 사용합니다.
+여러 활성 WKT record가 다르면 `conflicting-source-wkt`를 보고하고 해당 precedence의
+첫 값을 유지합니다.
+
+Rust reader는 header, VLR, COPC Info, LASZIP, Extra Bytes, WKT metadata를 Rust에서
+해석합니다. TypeScript range adapter는 제한된 header/VLR prefix, 순차 EVLR header,
+WKT EVLR payload만 가져옵니다. 다른 EVLR payload는 원격에 둡니다. byte source 크기를
+알 수 있으면 Rust는 가져오지 않은 payload를 포함해 선언된 모든 EVLR 범위를 검증합니다.
+EVLR 순회는 4,096개 record로 제한되며, 가져오는 WKT EVLR payload 총량은 설정된
+range-byte 제한을 넘지 않습니다.
 
 좌표 범위, 국가, 출력 좌표 라벨 또는 WGS84/ECEF 변환 결과로 CRS나 높이 기준을
 추론하지 않습니다. 수직 의미를 증명할 수 없으면 `local/unknown`입니다. WKT 문법

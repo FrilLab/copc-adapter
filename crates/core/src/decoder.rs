@@ -7,8 +7,8 @@ use laz::{LazItemType, LazVlr};
 use crate::binary::{read_array, read_i32, read_i64, read_u16, read_u32, read_u64};
 use crate::error::{CopcError, Result};
 use crate::extra_bytes::{ExtraBytesDescriptor, ExtraBytesPrimitive, ExtraBytesValue};
-use crate::header::{CopcHeader, parse_header};
-use crate::vlr::{VlrVisit, for_each_vlr};
+use crate::header::{CopcHeader, parse_header_prefix};
+use crate::vlr::{VlrVisit, for_each_vlr, parse_laz_vlr_payload, validate_laz_record_length};
 
 pub const FIELD_INTENSITY: u32 = 1 << 0;
 pub const FIELD_CLASSIFICATION: u32 = 1 << 1;
@@ -318,11 +318,13 @@ fn parse_laz_vlr(bytes: &[u8], header: &CopcHeader) -> Result<LazVlr> {
         "LAZ VLR payload offset overflows the input",
         |user_id, record_id, payload| {
             if user_id == LazVlr::USER_ID && record_id == LazVlr::RECORD_ID {
-                laz_vlr = Some(
-                    LazVlr::from_buffer(payload)
-                        .map_err(|value| CopcError::new("invalid-laz-vlr", value.to_string()))?,
-                );
-                return Ok(VlrVisit::Stop);
+                if laz_vlr.is_some() {
+                    return Err(CopcError::new(
+                        "duplicate-record",
+                        "LASZIP VLR occurs more than once",
+                    ));
+                }
+                laz_vlr = Some(parse_laz_vlr_payload(payload)?);
             }
             Ok(VlrVisit::Continue)
         },
@@ -337,21 +339,7 @@ fn parse_laz_vlr(bytes: &[u8], header: &CopcHeader) -> Result<LazVlr> {
 }
 
 fn validate_laz_layout(laz_vlr: &LazVlr, header: &CopcHeader) -> Result<()> {
-    let record_length = laz_vlr.items().iter().try_fold(0usize, |length, item| {
-        length
-            .checked_add(usize::from(item.size()))
-            .ok_or_else(|| CopcError::new("overflow", "LAZ record length overflows"))
-    })?;
     let declared_record_length = usize::from(header.point_data_record_length);
-    if record_length != declared_record_length {
-        return Err(CopcError::new(
-            "invalid-laz-vlr",
-            format!(
-                "LASZIP record length {record_length} does not match LAS record length {declared_record_length}"
-            ),
-        ));
-    }
-
     let (base_items, base_sizes): (&[LazItemType], &[usize]) = match header.point_data_record_format
     {
         6 => (&[LazItemType::Point14], &[30]),
@@ -364,6 +352,7 @@ fn validate_laz_layout(laz_vlr: &LazVlr, header: &CopcHeader) -> Result<()> {
             ));
         }
     };
+    validate_laz_record_length(laz_vlr, header.point_data_record_length)?;
     let base_record_length = base_sizes.iter().sum::<usize>();
     let extra_bytes = declared_record_length
         .checked_sub(base_record_length)
@@ -432,7 +421,7 @@ impl CopcNodeDecoder {
                 "COPC node chunk byte limit must be positive",
             ));
         }
-        let header = parse_header(metadata)?;
+        let header = parse_header_prefix(metadata)?;
         let laz_vlr = parse_laz_vlr(metadata, &header)?;
         validate_laz_layout(&laz_vlr, &header)?;
 
@@ -978,6 +967,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_laszip_records_with_a_stable_error() {
+        let (mut metadata, chunk) = compressed_fixture();
+        let mut position = usize::from(u16::from_le_bytes([metadata[94], metadata[95]]));
+        let count = u32::from_le_bytes(metadata[100..104].try_into().unwrap());
+        let mut laz_record = None;
+        for _ in 0..count {
+            let user_id = crate::binary::las_string(&metadata[position + 2..position + 18]);
+            let record_id = u16::from_le_bytes([metadata[position + 18], metadata[position + 19]]);
+            let length =
+                u16::from_le_bytes([metadata[position + 20], metadata[position + 21]]) as usize;
+            let end = position + 54 + length;
+            if user_id == LazVlr::USER_ID && record_id == LazVlr::RECORD_ID {
+                laz_record = Some(metadata[position..end].to_vec());
+                break;
+            }
+            position = end;
+        }
+        let laz_record = laz_record.expect("fixture contains its LASZIP VLR");
+        let old_point_data_offset = metadata.len();
+        metadata.extend_from_slice(&laz_record);
+        put_u32(
+            &mut metadata,
+            96,
+            (old_point_data_offset + laz_record.len()) as u32,
+        );
+        put_u32(&mut metadata, 100, count + 1);
+
+        let error = decode_copc_node(&metadata, &chunk, 2, 0)
+            .expect_err("duplicate LASZIP records are ambiguous");
+        assert_eq!(error.code(), "duplicate-record");
+    }
+
+    #[test]
     fn decodes_standard_fields_with_extra_bytes_for_point_formats_6_7_and_8() {
         for (point_format, expected_rgb) in [(6, false), (7, true), (8, true)] {
             let (metadata, chunk) = compressed_fixture_with_extra(point_format, 4);
@@ -1006,7 +1028,7 @@ mod tests {
     #[test]
     fn selectively_decodes_scalar_extra_bytes_and_preserves_64_bit_integers() {
         use super::{DecodedExtraDimensionValues, decode_copc_node_with_extra_dimensions};
-        use crate::parse_header;
+        use crate::parse_header_prefix;
 
         let mut raw_first = vec![0; 44];
         let mut raw_second = vec![0; 44];
@@ -1119,7 +1141,7 @@ mod tests {
             &DecodedExtraDimensionValues::Float64(vec![104.0, 154.0])
         );
         assert_eq!(
-            parse_header(&metadata).unwrap().extra_dimensions[10].decoded_no_data(),
+            parse_header_prefix(&metadata).unwrap().extra_dimensions[10].decoded_no_data(),
             Some(9.0)
         );
 

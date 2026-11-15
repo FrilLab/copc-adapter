@@ -19,6 +19,7 @@ import {
   assertRootHierarchyParity,
   openBackendPair,
 } from "../../../support/backend-contract.mjs";
+import { createDeterministicCopcFixture } from "../../../support/copc-fixture.mjs";
 import { HierarchyLoader } from "../../../../core/copc/hierarchy/HierarchyLoader.ts";
 
 const samplePath = path.resolve(
@@ -221,6 +222,84 @@ test("Rust reader parses project metadata and separates root page references", a
   });
 });
 
+test("Rust reader fetches EVLR headers and WKT payloads without reading unrelated payloads", async () => {
+  const wkt = 'GEOGCS["Remote EVLR"]';
+  const fixture = createDeterministicCopcFixture({
+    wktVlr: null,
+    wktEvlr: wkt,
+  });
+  const wktPayloadLength = new TextEncoder().encode(`${wkt}\0`).length;
+  const unrelatedPayload = new Uint8Array(4096).fill(0x5a);
+  const unrelatedHeaderOffset = fixture.bytes.length;
+  const bytes = new Uint8Array(
+    fixture.bytes.length + 60 + unrelatedPayload.byteLength,
+  );
+  bytes.set(fixture.bytes);
+  new TextEncoder().encode("TEST").forEach((value, index) => {
+    bytes[unrelatedHeaderOffset + 2 + index] = value;
+  });
+  putU16(bytes, unrelatedHeaderOffset + 18, 65000);
+  putU64(bytes, unrelatedHeaderOffset + 20, unrelatedPayload.byteLength);
+  bytes.set(unrelatedPayload, unrelatedHeaderOffset + 60);
+  putU32(bytes, 243, 2);
+
+  class RecordingByteSource extends InMemoryByteSource {
+    requests = [];
+
+    async readRange(offset, length, options) {
+      this.requests.push({ offset, length });
+      return super.readRange(offset, length, options);
+    }
+  }
+
+  const byteSource = new RecordingByteSource(bytes, "memory://selective-evlrs");
+  const source = await new RustCopcBackend({
+    createByteSource: () => byteSource,
+  }).open(byteSource.source);
+  assert.equal(source.getMetadata().wkt, wkt);
+
+  const wktPayloadOffset = fixture.evlrOffset + 60;
+  const unrelatedPayloadOffset = unrelatedHeaderOffset + 60;
+  assert.ok(
+    byteSource.requests.some(
+      ({ offset, length }) => offset === fixture.evlrOffset && length === 60,
+    ),
+  );
+  assert.ok(
+    byteSource.requests.some(
+      ({ offset, length }) => offset === wktPayloadOffset && length === wktPayloadLength,
+    ),
+  );
+  assert.ok(
+    byteSource.requests.some(
+      ({ offset, length }) => offset === unrelatedHeaderOffset && length === 60,
+    ),
+  );
+  assert.ok(
+    byteSource.requests.every(
+      ({ offset, length }) =>
+        offset !== unrelatedPayloadOffset || length !== unrelatedPayload.byteLength,
+    ),
+  );
+  assert.equal(
+    byteSource.requests.reduce((total, request) => total + request.length, 0),
+    375 + fixture.pointDataOffset + 60 + wktPayloadLength + 60,
+  );
+});
+
+test("Rust metadata rejects an EVLR payload truncated by the declared source size", async () => {
+  const fixture = createDeterministicCopcFixture({
+    wktVlr: null,
+    wktEvlr: 'GEOGCS["Truncated EVLR"]',
+  });
+  const truncated = fixture.bytes.slice(0, fixture.bytes.length - 1);
+  await assert.rejects(
+    () => RustCopcReader.open(new InMemoryByteSource(truncated)),
+    (error) =>
+      error instanceof RustCopcParseError && error.code === "invalid-header",
+  );
+});
+
 test("RustCopcBackend exposes the shared source contract without a viewer", async () => {
   const fixture = makeFixture();
   let requestedSource;
@@ -297,6 +376,36 @@ test("RustCopcBackend maps source, header, and point-chunk failures", async () =
       error.code === "point-chunk" &&
       error.nodeKey === node.key &&
       error.cause?.code === "out-of-bounds",
+  );
+});
+
+test("Rust WASM metadata parser reports duplicate COPC Info VLRs", async () => {
+  const fixture = makeFixture();
+  const view = new DataView(
+    fixture.bytes.buffer,
+    fixture.bytes.byteOffset,
+    fixture.bytes.byteLength,
+  );
+  const duplicateLength = 54 + view.getUint16(375 + 20, true);
+  const duplicateOffset = view.getUint32(96, true);
+  const bytes = new Uint8Array(fixture.bytes.length + duplicateLength);
+  bytes.set(fixture.bytes.subarray(0, duplicateOffset));
+  bytes.set(
+    fixture.bytes.subarray(375, 375 + duplicateLength),
+    duplicateOffset,
+  );
+  bytes.set(
+    fixture.bytes.subarray(duplicateOffset),
+    duplicateOffset + duplicateLength,
+  );
+  putU32(bytes, 96, duplicateOffset + duplicateLength);
+  putU32(bytes, 100, view.getUint32(100, true) + 1);
+  putU64(bytes, 375 + 54 + 40, fixture.rootPageOffset + duplicateLength);
+
+  await assert.rejects(
+    () => RustCopcReader.open(new InMemoryByteSource(bytes)),
+    (error) =>
+      error instanceof RustCopcParseError && error.code === "duplicate-record",
   );
 });
 

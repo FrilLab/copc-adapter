@@ -1,9 +1,11 @@
 use copc_adapter_core::{
-    CopcHeader, CopcNodePreparer, CrsTransform, DecodedExtraDimension, DecodedExtraDimensionValues,
-    ExtraBytesPrimitive, PreparedCopcNode, PreparedCopcNodeWithExtraDimensions, RootHierarchy,
-    decode_copc_node, decode_copc_node_with_extra_dimensions,
-    decode_copc_node_with_max_chunk_bytes, interleave_xyz, parse_header, parse_root_hierarchy,
-    parse_root_hierarchy_with_max_bytes,
+    CopcHeader, CopcMetadataLayout, CopcNodePreparer, CrsTransform, CrsWktProvenance, CrsWktSource,
+    DecodedExtraDimension, DecodedExtraDimensionValues, EvlrReadPlan, ExtraBytesPrimitive,
+    FetchedEvlr, PreparedCopcNode, PreparedCopcNodeWithExtraDimensions, RootHierarchy,
+    copc_metadata_layout, decode_copc_node, decode_copc_node_with_extra_dimensions,
+    decode_copc_node_with_max_chunk_bytes, interleave_xyz, parse_copc_metadata,
+    parse_header_prefix, parse_root_hierarchy, parse_root_hierarchy_with_max_bytes,
+    plan_next_evlr_read,
 };
 use serde::Serialize;
 use std::ffi::{CString, c_char};
@@ -25,6 +27,9 @@ use crate::memory::{
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const UNKNOWN_SOURCE_SIZE: u64 = u64::MAX;
+const EVLR_HEADER_SIZE: usize = 60;
+const EVLR_FRAME_HEADER_SIZE: usize = 76;
 
 #[derive(Debug, Serialize)]
 struct CopcHeaderJson {
@@ -40,8 +45,35 @@ struct CopcHeaderJson {
     spacing: f64,
     root_hierarchy_page_offset: u64,
     root_hierarchy_page_length: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     wkt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crs_wkt_provenance: Option<CrsWktProvenanceJson>,
     extra_dimensions: Vec<ExtraDimensionMetadataJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct CrsWktProvenanceJson {
+    selected: &'static str,
+    available: Vec<&'static str>,
+    conflicting: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CopcMetadataLayoutJson {
+    header_size: usize,
+    point_data_offset: usize,
+    first_evlr_offset: u64,
+    evlr_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct EvlrReadPlanJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_header_offset: Option<u64>,
+    payload_offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wkt_payload_length: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,7 +277,10 @@ fn safe_range_end(offset: u64, length: u64, what: &str) -> Result<(), ParseError
     Ok(())
 }
 
-fn header_json(value: CopcHeader) -> Result<CopcHeaderJson, ParseError> {
+fn header_json(
+    value: CopcHeader,
+    provenance: Option<CrsWktProvenance>,
+) -> Result<CopcHeaderJson, ParseError> {
     let point_count = safe_u64(value.point_count, "point count")?;
     let root_offset = safe_u64(
         value.root_hierarchy_page_offset,
@@ -271,6 +306,15 @@ fn header_json(value: CopcHeader) -> Result<CopcHeaderJson, ParseError> {
         root_hierarchy_page_offset: root_offset,
         root_hierarchy_page_length: root_length,
         wkt: value.wkt,
+        crs_wkt_provenance: provenance.map(|provenance| CrsWktProvenanceJson {
+            selected: provenance.selected.as_str(),
+            available: provenance
+                .available
+                .into_iter()
+                .map(CrsWktSource::as_str)
+                .collect(),
+            conflicting: provenance.conflicting,
+        }),
         extra_dimensions: value
             .extra_dimensions
             .into_iter()
@@ -462,7 +506,80 @@ fn copy_extra_dimensions(
 }
 
 fn parse_header_value(bytes: &[u8]) -> Result<CopcHeaderJson, ParseError> {
-    parse_header(bytes).map_err(from_core).and_then(header_json)
+    parse_header_prefix(bytes)
+        .map_err(from_core)
+        .and_then(|header| header_json(header, None))
+}
+
+fn metadata_layout_json(value: CopcMetadataLayout) -> Result<CopcMetadataLayoutJson, ParseError> {
+    Ok(CopcMetadataLayoutJson {
+        header_size: value.header_size,
+        point_data_offset: value.point_data_offset,
+        first_evlr_offset: safe_u64(value.first_evlr_offset, "first EVLR offset")?,
+        evlr_count: value.evlr_count,
+    })
+}
+
+fn evlr_read_plan_json(value: EvlrReadPlan) -> Result<EvlrReadPlanJson, ParseError> {
+    Ok(EvlrReadPlanJson {
+        next_header_offset: value
+            .next_header_offset
+            .map(|offset| safe_u64(offset, "next EVLR header offset"))
+            .transpose()?,
+        payload_offset: safe_u64(value.payload_offset, "EVLR payload offset")?,
+        wkt_payload_length: value.wkt_payload_length,
+    })
+}
+
+fn parse_evlr_directory(bytes: &[u8]) -> Result<Vec<FetchedEvlr<'_>>, ParseError> {
+    let mut records = Vec::new();
+    let mut position = 0usize;
+    while position < bytes.len() {
+        let frame_end = position
+            .checked_add(EVLR_FRAME_HEADER_SIZE)
+            .ok_or_else(|| error("overflow", "EVLR directory frame offset overflows"))?;
+        let frame = bytes
+            .get(position..frame_end)
+            .ok_or_else(|| error("truncated", "EVLR directory frame header is truncated"))?;
+        let offset = u64::from_le_bytes(
+            frame[..8]
+                .try_into()
+                .map_err(|_| error("truncated", "EVLR directory offset is truncated"))?,
+        );
+        let header = &frame[8..8 + EVLR_HEADER_SIZE];
+        let payload_length = u64::from_le_bytes(
+            frame[8 + EVLR_HEADER_SIZE..]
+                .try_into()
+                .map_err(|_| error("truncated", "EVLR directory payload length is truncated"))?,
+        );
+        position = frame_end;
+        let payload = if payload_length == UNKNOWN_SOURCE_SIZE {
+            None
+        } else {
+            let length = usize::try_from(payload_length)
+                .map_err(|_| error("unsupported-value", "EVLR payload is too large"))?;
+            let end = position
+                .checked_add(length)
+                .ok_or_else(|| error("overflow", "EVLR directory payload range overflows"))?;
+            let payload = bytes
+                .get(position..end)
+                .ok_or_else(|| error("truncated", "EVLR directory payload is truncated"))?;
+            position = end;
+            Some(payload)
+        };
+        records.push(FetchedEvlr {
+            offset,
+            header,
+            payload,
+        });
+        if records.len() > 4096 {
+            return Err(error(
+                "unsupported-value",
+                "EVLR directory exceeds the 4096-record safety limit",
+            ));
+        }
+    }
+    Ok(records)
 }
 
 fn parse_hierarchy_value(bytes: &[u8]) -> Result<RootHierarchyJson, ParseError> {
@@ -964,6 +1081,91 @@ pub extern "C" fn parse_copc_header_json(ptr: *const u8, length: usize) -> *mut 
     json_pointer(response)
 }
 
+/// Return LAS metadata offsets from the initial public header bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn plan_copc_metadata_layout_json(
+    ptr: *const u8,
+    length: usize,
+    max_prefix_bytes: usize,
+) -> *mut c_char {
+    let response = match validate_max_range_bytes(max_prefix_bytes).and_then(|limit| {
+        input_slice(ptr, length)
+            .and_then(|bytes| copc_metadata_layout(bytes, limit).map_err(from_core))
+            .and_then(metadata_layout_json)
+    }) {
+        Ok(value) => ParseResponse::success(value),
+        Err(parse_error) => ParseResponse::failure(parse_error),
+    };
+    json_pointer(response)
+}
+
+/// Inspect an EVLR header and return the next required header and WKT payload range.
+#[unsafe(no_mangle)]
+pub extern "C" fn plan_next_copc_evlr_read_json(
+    las_header_ptr: *const u8,
+    las_header_length: usize,
+    index: u32,
+    expected_header_offset: u64,
+    evlr_header_ptr: *const u8,
+    evlr_header_length: usize,
+    source_size: u64,
+    fetched_wkt_bytes: u64,
+    max_wkt_bytes: usize,
+) -> *mut c_char {
+    let response = match validate_max_range_bytes(max_wkt_bytes).and_then(|limit| {
+        let las_header = input_slice(las_header_ptr, las_header_length)?;
+        let evlr_header = input_slice(evlr_header_ptr, evlr_header_length)?;
+        plan_next_evlr_read(
+            las_header,
+            index,
+            expected_header_offset,
+            evlr_header,
+            (source_size != UNKNOWN_SOURCE_SIZE).then_some(source_size),
+            fetched_wkt_bytes,
+            limit,
+        )
+        .map_err(from_core)
+        .and_then(evlr_read_plan_json)
+    }) {
+        Ok(value) => ParseResponse::success(value),
+        Err(parse_error) => ParseResponse::failure(parse_error),
+    };
+    json_pointer(response)
+}
+
+/// Parse a metadata prefix plus selectively fetched WKT EVLR payloads.
+///
+/// Directory frames are `offset:u64, header:[u8;60], payloadLength:u64,
+/// payload:[u8;payloadLength]`; `u64::MAX` denotes a payload that was not
+/// fetched because it is not a CRS WKT record.
+#[unsafe(no_mangle)]
+pub extern "C" fn parse_copc_metadata_json(
+    prefix_ptr: *const u8,
+    prefix_length: usize,
+    directory_ptr: *const u8,
+    directory_length: usize,
+    source_size: u64,
+    max_wkt_bytes: usize,
+) -> *mut c_char {
+    let response = match validate_max_range_bytes(max_wkt_bytes).and_then(|limit| {
+        let prefix = input_slice(prefix_ptr, prefix_length)?;
+        let directory = input_slice(directory_ptr, directory_length)?;
+        let records = parse_evlr_directory(directory)?;
+        let parsed = parse_copc_metadata(
+            prefix,
+            &records,
+            (source_size != UNKNOWN_SOURCE_SIZE).then_some(source_size),
+            limit,
+        )
+        .map_err(from_core)?;
+        header_json(parsed.header, Some(parsed.crs_wkt_provenance))
+    }) {
+        Ok(value) => ParseResponse::success(value),
+        Err(parse_error) => ParseResponse::failure(parse_error),
+    };
+    json_pointer(response)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn parse_root_hierarchy_json(ptr: *const u8, length: usize) -> *mut c_char {
     let response = match input_slice(ptr, length).and_then(parse_hierarchy_value) {
@@ -1084,7 +1286,7 @@ pub extern "C" fn decode_copc_node_json(
             decode_copc_node(metadata, chunk, point_count, requested_fields)
                 .map_err(from_core)
                 .and_then(|decoded| {
-                    parse_header(metadata)
+                    parse_header_prefix(metadata)
                         .map_err(from_core)
                         .and_then(|header| validate_header_for_js(&header).map(|()| decoded))
                         .and_then(|decoded| {
@@ -1137,7 +1339,7 @@ pub extern "C" fn decode_copc_node_with_limit_json(
             )
             .map_err(from_core)
             .and_then(|decoded| {
-                parse_header(metadata)
+                parse_header_prefix(metadata)
                     .map_err(from_core)
                     .and_then(|header| validate_header_for_js(&header).map(|()| decoded))
                     .and_then(|decoded| {
@@ -1199,7 +1401,7 @@ pub extern "C" fn decode_copc_node_with_limit_and_extra_dimensions_json(
             limit,
         )
         .map_err(from_core)?;
-        let header = parse_header(metadata).map_err(from_core)?;
+        let header = parse_header_prefix(metadata).map_err(from_core)?;
         validate_header_for_js(&header)?;
         copy_decoded_node_with_extra_dimensions(
             decoded,
