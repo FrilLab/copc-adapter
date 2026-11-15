@@ -320,7 +320,6 @@ export class RustCopcNodePreparer {
         : new TextEncoder().encode(resolvedWkt);
     let resolvedWktPointer: number | undefined;
     try {
-      let responsePointer: number;
       if (resolvedWktBytes !== undefined) {
         resolvedWktPointer = requireRustWasmPointer(
           wasm.alloc_bytes(resolvedWktBytes.byteLength),
@@ -332,24 +331,16 @@ export class RustCopcNodePreparer {
           resolvedWktPointer,
           resolvedWktBytes.byteLength,
         ).set(resolvedWktBytes);
-        responsePointer =
-          wasm.create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
-            metadataPointer,
-            metadataBytes.byteLength,
-            resolvedWktPointer,
-            resolvedWktBytes.byteLength,
-            maximum,
-            heightOffset,
-          );
-      } else {
-        responsePointer =
-          wasm.create_copc_node_preparer_with_limit_and_height_offset_json(
-            metadataPointer,
-            metadataBytes.byteLength,
-            maximum,
-            heightOffset,
-          );
       }
+      const responsePointer =
+        wasm.create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
+          metadataPointer,
+          metadataBytes.byteLength,
+          resolvedWktPointer ?? 0,
+          resolvedWktBytes?.byteLength ?? 0,
+          maximum,
+          heightOffset,
+        );
       try {
         const response = JSON.parse(
           readCString(wasm.memory, responsePointer),

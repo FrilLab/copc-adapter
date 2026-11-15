@@ -814,6 +814,29 @@ mod tests {
         offset + 54 + payload.len()
     }
 
+    fn mark_fixture_wkt_vlr_superseded(metadata: &mut [u8]) {
+        let wkt_vlr_offset = 375 + 54 + 160;
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 18].fill(0);
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 2 + b"LASF_Spec".len()]
+            .copy_from_slice(b"LASF_Spec");
+        put_u16(metadata, wkt_vlr_offset + 18, 7);
+    }
+
+    fn append_wkt_evlr(mut metadata: Vec<u8>, wkt: &str) -> Vec<u8> {
+        let offset = metadata.len();
+        let mut payload = wkt.as_bytes().to_vec();
+        payload.push(0);
+        metadata.resize(offset + 60 + payload.len(), 0);
+        metadata[offset + 2..offset + 2 + b"LASF_Projection".len()]
+            .copy_from_slice(b"LASF_Projection");
+        put_u16(&mut metadata, offset + 18, 2112);
+        put_u64(&mut metadata, offset + 20, payload.len() as u64);
+        metadata[offset + 60..].copy_from_slice(&payload);
+        put_u64(&mut metadata, 235, offset as u64);
+        put_u32(&mut metadata, 243, 1);
+        metadata
+    }
+
     fn compressed_fixture() -> (Vec<u8>, Vec<u8>) {
         compressed_fixture_with_extra(7, 0)
     }
@@ -1309,11 +1332,7 @@ mod tests {
         const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
 
         let (mut metadata, _) = compressed_fixture();
-        let wkt_vlr_offset = 375 + 54 + 160;
-        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 18].fill(0);
-        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 2 + b"LASF_Spec".len()]
-            .copy_from_slice(b"LASF_Spec");
-        put_u16(&mut metadata, wkt_vlr_offset + 18, 7);
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
 
         let missing_wkt = CopcNodePreparer::from_metadata(&metadata)
             .err()
@@ -1328,6 +1347,32 @@ mod tests {
         )
         .expect("resolved EVLR WKT should initialize CRS preparation");
         assert!(!preparer.transform().used_horizontal_fallback());
+    }
+
+    #[test]
+    fn legacy_preparer_constructors_resolve_wkt_from_complete_evlr_metadata() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
+        put_f64(&mut metadata, 195, 200.0);
+        let metadata = append_wkt_evlr(metadata, RESOLVED_WKT);
+
+        for preparer in [
+            CopcNodePreparer::from_metadata(&metadata),
+            CopcNodePreparer::from_metadata_with_max_chunk_bytes(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            ),
+            CopcNodePreparer::from_metadata_with_height_offset(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+                0.0,
+            ),
+        ] {
+            let preparer = preparer.expect("legacy constructors should resolve the EVLR WKT");
+            assert!(!preparer.transform().used_horizontal_fallback());
+        }
     }
 
     #[test]

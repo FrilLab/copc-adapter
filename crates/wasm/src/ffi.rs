@@ -665,12 +665,13 @@ fn create_copc_node_preparer_value_with_max_chunk_bytes_and_height_offset(
     max_chunk_bytes: usize,
     height_offset_meters: f64,
 ) -> Result<CopcNodePreparerHandle, ParseError> {
-    create_copc_node_preparer_value_with_resolved_wkt(
+    let preparer = CopcNodePreparer::from_metadata_with_height_offset(
         metadata,
-        None,
         max_chunk_bytes,
         height_offset_meters,
     )
+    .map_err(from_core)?;
+    create_copc_node_preparer_handle(preparer)
 }
 
 fn create_copc_node_preparer_value_with_resolved_wkt(

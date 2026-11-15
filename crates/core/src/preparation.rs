@@ -4,6 +4,7 @@ use crate::decoder::{
     DecodedCopcNodeWithExtraDimensions, DecodedExtraDimension,
 };
 use crate::error::{CopcError, Result};
+use crate::header::parse_header;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedPointRange {
@@ -65,9 +66,10 @@ impl CopcNodePreparer {
         max_node_chunk_bytes: usize,
         height_offset_meters: f64,
     ) -> Result<Self> {
+        let header = parse_header(metadata)?;
         Self::from_metadata_with_resolved_wkt(
             metadata,
-            None,
+            header.wkt.as_deref(),
             max_node_chunk_bytes,
             height_offset_meters,
         )
