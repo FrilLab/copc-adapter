@@ -141,6 +141,14 @@ export type CopcWasmExports = {
     maxChunkBytes: number,
     heightOffsetMeters: number,
   ): number;
+  create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
+    metadataPointer: number,
+    metadataLength: number,
+    resolvedWktPointer: number,
+    resolvedWktLength: number,
+    maxChunkBytes: number,
+    heightOffsetMeters: number,
+  ): number;
   prepare_copc_node_json(
     handle: number,
     chunkPointer: number,

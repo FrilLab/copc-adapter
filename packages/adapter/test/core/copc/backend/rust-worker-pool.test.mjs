@@ -177,11 +177,12 @@ test("Rust decode worker pool passes the configured range limit to workers", asy
     maxRangeBytes: 128 * 1024 * 1024,
     heightOffsetMeters: -22.5,
   });
-  pool.setMetadata(new Uint8Array([9, 8, 7]));
+  pool.setMetadata(new Uint8Array([9, 8, 7]), "PROJCS[\"EVLR CRS\"]");
 
   await pool.submit(request("configured-limit"));
   assert.equal(harness.initializations[0].maxRangeBytes, 128 * 1024 * 1024);
   assert.equal(harness.initializations[0].heightOffsetMeters, -22.5);
+  assert.equal(harness.initializations[0].resolvedWkt, "PROJCS[\"EVLR CRS\"]");
   pool.destroy();
 });
 

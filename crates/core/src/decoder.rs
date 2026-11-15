@@ -1305,6 +1305,32 @@ mod tests {
     }
 
     #[test]
+    fn preparer_uses_resolved_evlr_wkt_with_a_bounded_prefix() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        let wkt_vlr_offset = 375 + 54 + 160;
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 18].fill(0);
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 2 + b"LASF_Spec".len()]
+            .copy_from_slice(b"LASF_Spec");
+        put_u16(&mut metadata, wkt_vlr_offset + 18, 7);
+
+        let missing_wkt = CopcNodePreparer::from_metadata(&metadata)
+            .err()
+            .expect("projected bounds need an active CRS");
+        assert_eq!(missing_wkt.code(), "missing-wkt");
+
+        let preparer = CopcNodePreparer::from_metadata_with_resolved_wkt(
+            &metadata,
+            Some(RESOLVED_WKT),
+            crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            0.0,
+        )
+        .expect("resolved EVLR WKT should initialize CRS preparation");
+        assert!(!preparer.transform().used_horizontal_fallback());
+    }
+
+    #[test]
     fn rejects_decode_limits_and_malformed_chunks() {
         let (metadata, chunk) = compressed_fixture();
         assert_eq!(

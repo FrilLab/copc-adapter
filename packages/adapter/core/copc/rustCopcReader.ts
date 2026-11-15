@@ -632,7 +632,7 @@ export class RustCopcReader {
       normalizeCopcExtraDimensionSelection(options.extraDimensions),
     );
     reader.metadataBytes = metadataPrefix;
-    reader.decodeWorkerPool?.setMetadata(metadataPrefix);
+    reader.decodeWorkerPool?.setMetadata(metadataPrefix, header.wkt);
     return reader;
   }
 
@@ -850,6 +850,7 @@ export class RustCopcReader {
         loadCopcWasm,
         this.maxRangeBytes,
         this.heightOffsetMeters,
+        this.header.wkt,
       );
     }
     const result = (await this.nodePreparer).prepare(

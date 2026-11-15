@@ -665,8 +665,23 @@ fn create_copc_node_preparer_value_with_max_chunk_bytes_and_height_offset(
     max_chunk_bytes: usize,
     height_offset_meters: f64,
 ) -> Result<CopcNodePreparerHandle, ParseError> {
-    let preparer = CopcNodePreparer::from_metadata_with_height_offset(
+    create_copc_node_preparer_value_with_resolved_wkt(
         metadata,
+        None,
+        max_chunk_bytes,
+        height_offset_meters,
+    )
+}
+
+fn create_copc_node_preparer_value_with_resolved_wkt(
+    metadata: &[u8],
+    resolved_wkt: Option<&str>,
+    max_chunk_bytes: usize,
+    height_offset_meters: f64,
+) -> Result<CopcNodePreparerHandle, ParseError> {
+    let preparer = CopcNodePreparer::from_metadata_with_resolved_wkt(
+        metadata,
+        resolved_wkt,
         max_chunk_bytes,
         height_offset_meters,
     )
@@ -826,6 +841,43 @@ pub extern "C" fn create_copc_node_preparer_with_limit_and_height_offset_json(
                 height_offset_meters,
             )
         })
+    }) {
+        Ok(value) => ParseResponse::success(value),
+        Err(parse_error) => ParseResponse::failure(parse_error),
+    };
+    json_pointer(response)
+}
+
+/// Create a node preparer from prefix bytes and a separately resolved CRS WKT.
+#[unsafe(no_mangle)]
+pub extern "C" fn create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
+    metadata_ptr: *const u8,
+    metadata_length: usize,
+    resolved_wkt_ptr: *const u8,
+    resolved_wkt_length: usize,
+    max_chunk_bytes: usize,
+    height_offset_meters: f64,
+) -> *mut c_char {
+    let response = match validate_max_range_bytes(max_chunk_bytes).and_then(|limit| {
+        let metadata = input_slice(metadata_ptr, metadata_length)?;
+        let resolved_wkt = if resolved_wkt_ptr.is_null() {
+            if resolved_wkt_length != 0 {
+                return Err(error("invalid-input", "resolved CRS WKT pointer is null"));
+            }
+            None
+        } else {
+            let bytes = input_slice(resolved_wkt_ptr, resolved_wkt_length)?;
+            Some(
+                std::str::from_utf8(bytes)
+                    .map_err(|_| error("malformed-wkt", "resolved CRS WKT is not valid UTF-8"))?,
+            )
+        };
+        create_copc_node_preparer_value_with_resolved_wkt(
+            metadata,
+            resolved_wkt,
+            limit,
+            height_offset_meters,
+        )
     }) {
         Ok(value) => ParseResponse::success(value),
         Err(parse_error) => ParseResponse::failure(parse_error),
