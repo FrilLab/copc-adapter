@@ -86,8 +86,10 @@ impl CopcNodePreparer {
         max_node_chunk_bytes: usize,
         height_offset_meters: f64,
     ) -> Result<Self> {
-        let decoder =
-            CopcNodeDecoder::from_metadata_with_max_chunk_bytes(metadata, max_node_chunk_bytes)?;
+        let decoder = CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(
+            metadata,
+            max_node_chunk_bytes,
+        )?;
         let header = decoder.header();
         let transform = CrsTransform::from_wkt_or_geographic(
             resolved_wkt.or(header.wkt.as_deref()),

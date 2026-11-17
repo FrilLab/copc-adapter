@@ -7,7 +7,7 @@ use laz::{LazItemType, LazVlr};
 use crate::binary::{read_array, read_i32, read_i64, read_u16, read_u32, read_u64};
 use crate::error::{CopcError, Result};
 use crate::extra_bytes::{ExtraBytesDescriptor, ExtraBytesPrimitive, ExtraBytesValue};
-use crate::header::{CopcHeader, parse_header_prefix};
+use crate::header::{CopcHeader, parse_header, parse_header_prefix};
 use crate::vlr::{VlrVisit, for_each_vlr, parse_laz_vlr_payload, validate_laz_record_length};
 
 pub const FIELD_INTENSITY: u32 = 1 << 0;
@@ -415,13 +415,37 @@ impl CopcNodeDecoder {
         metadata: &[u8],
         max_node_chunk_bytes: usize,
     ) -> Result<Self> {
+        Self::from_metadata_with_header_parser(metadata, max_node_chunk_bytes, parse_header)
+    }
+
+    /// Initialize a decoder from a bounded LAS header/VLR prefix.
+    ///
+    /// This path does not follow EVLR offsets. Range-based readers should
+    /// supply separately resolved WKT to their preparation path when needed.
+    pub fn from_metadata_prefix(metadata: &[u8]) -> Result<Self> {
+        Self::from_metadata_prefix_with_max_chunk_bytes(metadata, DEFAULT_MAX_NODE_CHUNK_BYTES)
+    }
+
+    /// Initialize a bounded-prefix decoder with a caller-supplied chunk limit.
+    pub fn from_metadata_prefix_with_max_chunk_bytes(
+        metadata: &[u8],
+        max_node_chunk_bytes: usize,
+    ) -> Result<Self> {
+        Self::from_metadata_with_header_parser(metadata, max_node_chunk_bytes, parse_header_prefix)
+    }
+
+    fn from_metadata_with_header_parser(
+        metadata: &[u8],
+        max_node_chunk_bytes: usize,
+        parse_header: fn(&[u8]) -> Result<CopcHeader>,
+    ) -> Result<Self> {
         if max_node_chunk_bytes == 0 {
             return Err(CopcError::new(
                 "invalid-value",
                 "COPC node chunk byte limit must be positive",
             ));
         }
-        let header = parse_header_prefix(metadata)?;
+        let header = parse_header(metadata)?;
         let laz_vlr = parse_laz_vlr(metadata, &header)?;
         validate_laz_layout(&laz_vlr, &header)?;
 
@@ -765,7 +789,7 @@ mod tests {
     use laz::record::{LayeredPointRecordCompressor, RecordCompressor};
     use laz::{LazVlr, LazVlrBuilder};
 
-    use crate::CopcNodePreparer;
+    use crate::{CopcNodeDecoder, CopcNodePreparer};
 
     use super::{
         DecodedCopcNode, FIELD_CLASSIFICATION, FIELD_INTENSITY, FIELD_RGB, decode_copc_node,
@@ -1373,6 +1397,34 @@ mod tests {
             let preparer = preparer.expect("legacy constructors should resolve the EVLR WKT");
             assert!(!preparer.transform().used_horizontal_fallback());
         }
+    }
+
+    #[test]
+    fn legacy_decoder_constructors_preserve_evlr_wkt_in_the_public_header() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
+        let prefix_length = metadata.len();
+        let metadata = append_wkt_evlr(metadata, RESOLVED_WKT);
+
+        for decoder in [
+            CopcNodeDecoder::from_metadata(&metadata),
+            CopcNodeDecoder::from_metadata_with_max_chunk_bytes(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            ),
+        ] {
+            let decoder = decoder.expect("legacy constructors should resolve the EVLR WKT");
+            assert_eq!(decoder.header().wkt.as_deref(), Some(RESOLVED_WKT));
+        }
+
+        let prefix_decoder = CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(
+            &metadata[..prefix_length],
+            crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+        )
+        .expect("bounded-prefix decoder should not follow the EVLR");
+        assert_eq!(prefix_decoder.header().wkt, None);
     }
 
     #[test]

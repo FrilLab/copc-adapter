@@ -1,10 +1,9 @@
 use copc_adapter_core::{
-    CopcHeader, CopcMetadataLayout, CopcNodePreparer, CrsTransform, CrsWktProvenance, CrsWktSource,
-    DecodedExtraDimension, DecodedExtraDimensionValues, EvlrReadPlan, ExtraBytesPrimitive,
-    FetchedEvlr, PreparedCopcNode, PreparedCopcNodeWithExtraDimensions, RootHierarchy,
-    copc_metadata_layout, decode_copc_node, decode_copc_node_with_extra_dimensions,
-    decode_copc_node_with_max_chunk_bytes, interleave_xyz, parse_copc_metadata, parse_header,
-    parse_header_prefix, parse_root_hierarchy, parse_root_hierarchy_with_max_bytes,
+    CopcHeader, CopcMetadataLayout, CopcNodeDecoder, CopcNodePreparer, CrsTransform,
+    CrsWktProvenance, CrsWktSource, DecodedExtraDimension, DecodedExtraDimensionValues,
+    EvlrReadPlan, ExtraBytesPrimitive, FetchedEvlr, PreparedCopcNode,
+    PreparedCopcNodeWithExtraDimensions, RootHierarchy, copc_metadata_layout, interleave_xyz,
+    parse_copc_metadata, parse_header, parse_root_hierarchy, parse_root_hierarchy_with_max_bytes,
     plan_next_evlr_read,
 };
 use serde::Serialize;
@@ -1335,28 +1334,25 @@ pub extern "C" fn decode_copc_node_json(
         input_slice(metadata_ptr, metadata_length),
         input_slice(chunk_ptr, chunk_length),
     ) {
-        (Ok(metadata), Ok(chunk)) => {
-            decode_copc_node(metadata, chunk, point_count, requested_fields)
-                .map_err(from_core)
-                .and_then(|decoded| {
-                    parse_header_prefix(metadata)
-                        .map_err(from_core)
-                        .and_then(|header| validate_header_for_js(&header).map(|()| decoded))
-                        .and_then(|decoded| {
-                            copy_decoded_node(
-                                decoded,
-                                coordinates_ptr,
-                                intensity_ptr,
-                                classification_ptr,
-                                red_ptr,
-                                green_ptr,
-                                blue_ptr,
-                            )
-                        })
-                })
-                .map(ParseResponse::success)
-                .unwrap_or_else(ParseResponse::failure)
-        }
+        (Ok(metadata), Ok(chunk)) => CopcNodeDecoder::from_metadata_prefix(metadata)
+            .map_err(from_core)
+            .and_then(|decoder| {
+                let decoded = decoder
+                    .decode(chunk, point_count, requested_fields)
+                    .map_err(from_core)?;
+                validate_header_for_js(decoder.header())?;
+                copy_decoded_node(
+                    decoded,
+                    coordinates_ptr,
+                    intensity_ptr,
+                    classification_ptr,
+                    red_ptr,
+                    green_ptr,
+                    blue_ptr,
+                )
+            })
+            .map(ParseResponse::success)
+            .unwrap_or_else(ParseResponse::failure),
         (Err(parse_error), _) | (_, Err(parse_error)) => ParseResponse::failure(parse_error),
     };
     json_pointer(response)
@@ -1383,30 +1379,24 @@ pub extern "C" fn decode_copc_node_with_limit_json(
             input_slice(metadata_ptr, metadata_length),
             input_slice(chunk_ptr, chunk_length),
         ) {
-            (Ok(metadata), Ok(chunk)) => decode_copc_node_with_max_chunk_bytes(
-                metadata,
-                chunk,
-                point_count,
-                requested_fields,
-                limit,
-            )
-            .map_err(from_core)
-            .and_then(|decoded| {
-                parse_header_prefix(metadata)
-                    .map_err(from_core)
-                    .and_then(|header| validate_header_for_js(&header).map(|()| decoded))
-                    .and_then(|decoded| {
-                        copy_decoded_node(
-                            decoded,
-                            coordinates_ptr,
-                            intensity_ptr,
-                            classification_ptr,
-                            red_ptr,
-                            green_ptr,
-                            blue_ptr,
-                        )
-                    })
-            }),
+            (Ok(metadata), Ok(chunk)) => {
+                let decoder =
+                    CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(metadata, limit)
+                        .map_err(from_core)?;
+                let decoded = decoder
+                    .decode(chunk, point_count, requested_fields)
+                    .map_err(from_core)?;
+                validate_header_for_js(decoder.header())?;
+                copy_decoded_node(
+                    decoded,
+                    coordinates_ptr,
+                    intensity_ptr,
+                    classification_ptr,
+                    red_ptr,
+                    green_ptr,
+                    blue_ptr,
+                )
+            }
             (Err(parse_error), _) | (_, Err(parse_error)) => Err(parse_error),
         }
     }) {
@@ -1445,17 +1435,12 @@ pub extern "C" fn decode_copc_node_with_limit_and_extra_dimensions_json(
             .and_then(parse_extra_dimension_selection)?;
         let metadata = input_slice(metadata_ptr, metadata_length)?;
         let chunk = input_slice(chunk_ptr, chunk_length)?;
-        let decoded = decode_copc_node_with_extra_dimensions(
-            metadata,
-            chunk,
-            point_count,
-            requested_fields,
-            &names,
-            limit,
-        )
-        .map_err(from_core)?;
-        let header = parse_header_prefix(metadata).map_err(from_core)?;
-        validate_header_for_js(&header)?;
+        let decoder = CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(metadata, limit)
+            .map_err(from_core)?;
+        let decoded = decoder
+            .decode_with_extra_dimensions(chunk, point_count, requested_fields, &names)
+            .map_err(from_core)?;
+        validate_header_for_js(decoder.header())?;
         copy_decoded_node_with_extra_dimensions(
             decoded,
             DecodedOutputPointers {
