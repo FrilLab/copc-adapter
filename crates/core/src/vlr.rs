@@ -1,12 +1,34 @@
 use crate::binary::{ensure_range, las_string, read_u16, read_u64};
 use crate::error::{CopcError, Result};
+use laz::LazVlr;
 
 pub(crate) const VLR_HEADER_SIZE: usize = 54;
 pub(crate) const EVLR_HEADER_SIZE: usize = 60;
 
+pub(crate) fn parse_laz_vlr_payload(payload: &[u8]) -> Result<LazVlr> {
+    LazVlr::from_buffer(payload)
+        .map_err(|value| CopcError::new("invalid-laz-vlr", value.to_string()))
+}
+
+pub(crate) fn validate_laz_record_length(laz_vlr: &LazVlr, declared_length: u16) -> Result<()> {
+    let record_length = laz_vlr.items().iter().try_fold(0usize, |length, item| {
+        length
+            .checked_add(usize::from(item.size()))
+            .ok_or_else(|| CopcError::new("overflow", "LAZ record length overflows"))
+    })?;
+    if record_length != usize::from(declared_length) {
+        return Err(CopcError::new(
+            "invalid-laz-vlr",
+            format!(
+                "LASZIP record length {record_length} does not match LAS record length {declared_length}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) enum VlrVisit {
     Continue,
-    Stop,
 }
 
 pub(crate) fn for_each_vlr<F>(
@@ -38,29 +60,24 @@ where
             ));
         }
 
-        if matches!(
-            visit(
-                &record_user_id,
-                record_id,
-                &bytes[payload_start..payload_end],
-            )?,
-            VlrVisit::Stop
-        ) {
-            return Ok(());
-        }
+        visit(
+            &record_user_id,
+            record_id,
+            &bytes[payload_start..payload_end],
+        )?;
         position = payload_end;
     }
     Ok(())
 }
 
-pub(crate) fn for_each_evlr<F>(
-    bytes: &[u8],
+pub(crate) fn for_each_evlr<'a, F>(
+    bytes: &'a [u8],
     start_offset: usize,
     number_of_evlrs: usize,
     mut visit: F,
 ) -> Result<()>
 where
-    F: FnMut(&str, u16, &[u8]) -> Result<VlrVisit>,
+    F: FnMut(&str, u16, &'a [u8]) -> Result<VlrVisit>,
 {
     let mut position = start_offset;
     for _ in 0..number_of_evlrs {
@@ -76,16 +93,11 @@ where
         let payload_end = payload_start
             .checked_add(record_length)
             .ok_or_else(|| CopcError::new("overflow", "EVLR payload end overflows"))?;
-        if matches!(
-            visit(
-                &record_user_id,
-                record_id,
-                &bytes[payload_start..payload_end],
-            )?,
-            VlrVisit::Stop
-        ) {
-            return Ok(());
-        }
+        visit(
+            &record_user_id,
+            record_id,
+            &bytes[payload_start..payload_end],
+        )?;
         position = payload_end;
     }
     Ok(())

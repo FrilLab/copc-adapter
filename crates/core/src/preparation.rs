@@ -4,6 +4,7 @@ use crate::decoder::{
     DecodedCopcNodeWithExtraDimensions, DecodedExtraDimension,
 };
 use crate::error::{CopcError, Result};
+use crate::header::parse_header;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedPointRange {
@@ -65,11 +66,33 @@ impl CopcNodePreparer {
         max_node_chunk_bytes: usize,
         height_offset_meters: f64,
     ) -> Result<Self> {
-        let decoder =
-            CopcNodeDecoder::from_metadata_with_max_chunk_bytes(metadata, max_node_chunk_bytes)?;
+        let header = parse_header(metadata)?;
+        Self::from_metadata_with_resolved_wkt(
+            metadata,
+            header.wkt.as_deref(),
+            max_node_chunk_bytes,
+            height_offset_meters,
+        )
+    }
+
+    /// Initialize from the bounded metadata prefix and an optional WKT value
+    /// already resolved from selectively fetched EVLR metadata.
+    ///
+    /// The explicit WKT is used only when supplied. Otherwise the value
+    /// parsed from the metadata prefix remains authoritative.
+    pub fn from_metadata_with_resolved_wkt(
+        metadata: &[u8],
+        resolved_wkt: Option<&str>,
+        max_node_chunk_bytes: usize,
+        height_offset_meters: f64,
+    ) -> Result<Self> {
+        let decoder = CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(
+            metadata,
+            max_node_chunk_bytes,
+        )?;
         let header = decoder.header();
         let transform = CrsTransform::from_wkt_or_geographic(
-            header.wkt.as_deref(),
+            resolved_wkt.or(header.wkt.as_deref()),
             [
                 header.bounds[0],
                 header.bounds[1],

@@ -7,8 +7,8 @@ use laz::{LazItemType, LazVlr};
 use crate::binary::{read_array, read_i32, read_i64, read_u16, read_u32, read_u64};
 use crate::error::{CopcError, Result};
 use crate::extra_bytes::{ExtraBytesDescriptor, ExtraBytesPrimitive, ExtraBytesValue};
-use crate::header::{CopcHeader, parse_header};
-use crate::vlr::{VlrVisit, for_each_vlr};
+use crate::header::{CopcHeader, parse_header, parse_header_prefix};
+use crate::vlr::{VlrVisit, for_each_vlr, parse_laz_vlr_payload, validate_laz_record_length};
 
 pub const FIELD_INTENSITY: u32 = 1 << 0;
 pub const FIELD_CLASSIFICATION: u32 = 1 << 1;
@@ -318,11 +318,13 @@ fn parse_laz_vlr(bytes: &[u8], header: &CopcHeader) -> Result<LazVlr> {
         "LAZ VLR payload offset overflows the input",
         |user_id, record_id, payload| {
             if user_id == LazVlr::USER_ID && record_id == LazVlr::RECORD_ID {
-                laz_vlr = Some(
-                    LazVlr::from_buffer(payload)
-                        .map_err(|value| CopcError::new("invalid-laz-vlr", value.to_string()))?,
-                );
-                return Ok(VlrVisit::Stop);
+                if laz_vlr.is_some() {
+                    return Err(CopcError::new(
+                        "duplicate-record",
+                        "LASZIP VLR occurs more than once",
+                    ));
+                }
+                laz_vlr = Some(parse_laz_vlr_payload(payload)?);
             }
             Ok(VlrVisit::Continue)
         },
@@ -337,21 +339,7 @@ fn parse_laz_vlr(bytes: &[u8], header: &CopcHeader) -> Result<LazVlr> {
 }
 
 fn validate_laz_layout(laz_vlr: &LazVlr, header: &CopcHeader) -> Result<()> {
-    let record_length = laz_vlr.items().iter().try_fold(0usize, |length, item| {
-        length
-            .checked_add(usize::from(item.size()))
-            .ok_or_else(|| CopcError::new("overflow", "LAZ record length overflows"))
-    })?;
     let declared_record_length = usize::from(header.point_data_record_length);
-    if record_length != declared_record_length {
-        return Err(CopcError::new(
-            "invalid-laz-vlr",
-            format!(
-                "LASZIP record length {record_length} does not match LAS record length {declared_record_length}"
-            ),
-        ));
-    }
-
     let (base_items, base_sizes): (&[LazItemType], &[usize]) = match header.point_data_record_format
     {
         6 => (&[LazItemType::Point14], &[30]),
@@ -364,6 +352,7 @@ fn validate_laz_layout(laz_vlr: &LazVlr, header: &CopcHeader) -> Result<()> {
             ));
         }
     };
+    validate_laz_record_length(laz_vlr, header.point_data_record_length)?;
     let base_record_length = base_sizes.iter().sum::<usize>();
     let extra_bytes = declared_record_length
         .checked_sub(base_record_length)
@@ -425,6 +414,30 @@ impl CopcNodeDecoder {
     pub fn from_metadata_with_max_chunk_bytes(
         metadata: &[u8],
         max_node_chunk_bytes: usize,
+    ) -> Result<Self> {
+        Self::from_metadata_with_header_parser(metadata, max_node_chunk_bytes, parse_header)
+    }
+
+    /// Initialize a decoder from a bounded LAS header/VLR prefix.
+    ///
+    /// This path does not follow EVLR offsets. Range-based readers should
+    /// supply separately resolved WKT to their preparation path when needed.
+    pub fn from_metadata_prefix(metadata: &[u8]) -> Result<Self> {
+        Self::from_metadata_prefix_with_max_chunk_bytes(metadata, DEFAULT_MAX_NODE_CHUNK_BYTES)
+    }
+
+    /// Initialize a bounded-prefix decoder with a caller-supplied chunk limit.
+    pub fn from_metadata_prefix_with_max_chunk_bytes(
+        metadata: &[u8],
+        max_node_chunk_bytes: usize,
+    ) -> Result<Self> {
+        Self::from_metadata_with_header_parser(metadata, max_node_chunk_bytes, parse_header_prefix)
+    }
+
+    fn from_metadata_with_header_parser(
+        metadata: &[u8],
+        max_node_chunk_bytes: usize,
+        parse_header: fn(&[u8]) -> Result<CopcHeader>,
     ) -> Result<Self> {
         if max_node_chunk_bytes == 0 {
             return Err(CopcError::new(
@@ -776,7 +789,7 @@ mod tests {
     use laz::record::{LayeredPointRecordCompressor, RecordCompressor};
     use laz::{LazVlr, LazVlrBuilder};
 
-    use crate::CopcNodePreparer;
+    use crate::{CopcNodeDecoder, CopcNodePreparer};
 
     use super::{
         DecodedCopcNode, FIELD_CLASSIFICATION, FIELD_INTENSITY, FIELD_RGB, decode_copc_node,
@@ -823,6 +836,29 @@ mod tests {
         put_u16(bytes, offset + 20, payload.len() as u16);
         bytes[offset + 54..offset + 54 + payload.len()].copy_from_slice(payload);
         offset + 54 + payload.len()
+    }
+
+    fn mark_fixture_wkt_vlr_superseded(metadata: &mut [u8]) {
+        let wkt_vlr_offset = 375 + 54 + 160;
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 18].fill(0);
+        metadata[wkt_vlr_offset + 2..wkt_vlr_offset + 2 + b"LASF_Spec".len()]
+            .copy_from_slice(b"LASF_Spec");
+        put_u16(metadata, wkt_vlr_offset + 18, 7);
+    }
+
+    fn append_wkt_evlr(mut metadata: Vec<u8>, wkt: &str) -> Vec<u8> {
+        let offset = metadata.len();
+        let mut payload = wkt.as_bytes().to_vec();
+        payload.push(0);
+        metadata.resize(offset + 60 + payload.len(), 0);
+        metadata[offset + 2..offset + 2 + b"LASF_Projection".len()]
+            .copy_from_slice(b"LASF_Projection");
+        put_u16(&mut metadata, offset + 18, 2112);
+        put_u64(&mut metadata, offset + 20, payload.len() as u64);
+        metadata[offset + 60..].copy_from_slice(&payload);
+        put_u64(&mut metadata, 235, offset as u64);
+        put_u32(&mut metadata, 243, 1);
+        metadata
     }
 
     fn compressed_fixture() -> (Vec<u8>, Vec<u8>) {
@@ -978,6 +1014,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_laszip_records_with_a_stable_error() {
+        let (mut metadata, chunk) = compressed_fixture();
+        let mut position = usize::from(u16::from_le_bytes([metadata[94], metadata[95]]));
+        let count = u32::from_le_bytes(metadata[100..104].try_into().unwrap());
+        let mut laz_record = None;
+        for _ in 0..count {
+            let user_id = crate::binary::las_string(&metadata[position + 2..position + 18]);
+            let record_id = u16::from_le_bytes([metadata[position + 18], metadata[position + 19]]);
+            let length =
+                u16::from_le_bytes([metadata[position + 20], metadata[position + 21]]) as usize;
+            let end = position + 54 + length;
+            if user_id == LazVlr::USER_ID && record_id == LazVlr::RECORD_ID {
+                laz_record = Some(metadata[position..end].to_vec());
+                break;
+            }
+            position = end;
+        }
+        let laz_record = laz_record.expect("fixture contains its LASZIP VLR");
+        let old_point_data_offset = metadata.len();
+        metadata.extend_from_slice(&laz_record);
+        put_u32(
+            &mut metadata,
+            96,
+            (old_point_data_offset + laz_record.len()) as u32,
+        );
+        put_u32(&mut metadata, 100, count + 1);
+
+        let error = decode_copc_node(&metadata, &chunk, 2, 0)
+            .expect_err("duplicate LASZIP records are ambiguous");
+        assert_eq!(error.code(), "duplicate-record");
+    }
+
+    #[test]
     fn decodes_standard_fields_with_extra_bytes_for_point_formats_6_7_and_8() {
         for (point_format, expected_rgb) in [(6, false), (7, true), (8, true)] {
             let (metadata, chunk) = compressed_fixture_with_extra(point_format, 4);
@@ -1006,7 +1075,7 @@ mod tests {
     #[test]
     fn selectively_decodes_scalar_extra_bytes_and_preserves_64_bit_integers() {
         use super::{DecodedExtraDimensionValues, decode_copc_node_with_extra_dimensions};
-        use crate::parse_header;
+        use crate::parse_header_prefix;
 
         let mut raw_first = vec![0; 44];
         let mut raw_second = vec![0; 44];
@@ -1119,7 +1188,7 @@ mod tests {
             &DecodedExtraDimensionValues::Float64(vec![104.0, 154.0])
         );
         assert_eq!(
-            parse_header(&metadata).unwrap().extra_dimensions[10].decoded_no_data(),
+            parse_header_prefix(&metadata).unwrap().extra_dimensions[10].decoded_no_data(),
             Some(9.0)
         );
 
@@ -1280,6 +1349,82 @@ mod tests {
         assert_eq!(prepared.statistics.intensity.as_ref().unwrap().min, 400.0);
         assert_eq!(prepared.statistics.intensity.as_ref().unwrap().max, 401.0);
         assert_eq!(prepared.statistics.rgb_max, Some(65535));
+    }
+
+    #[test]
+    fn preparer_uses_resolved_evlr_wkt_with_a_bounded_prefix() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
+
+        let missing_wkt = CopcNodePreparer::from_metadata(&metadata)
+            .err()
+            .expect("projected bounds need an active CRS");
+        assert_eq!(missing_wkt.code(), "missing-wkt");
+
+        let preparer = CopcNodePreparer::from_metadata_with_resolved_wkt(
+            &metadata,
+            Some(RESOLVED_WKT),
+            crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            0.0,
+        )
+        .expect("resolved EVLR WKT should initialize CRS preparation");
+        assert!(!preparer.transform().used_horizontal_fallback());
+    }
+
+    #[test]
+    fn legacy_preparer_constructors_resolve_wkt_from_complete_evlr_metadata() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
+        put_f64(&mut metadata, 195, 200.0);
+        let metadata = append_wkt_evlr(metadata, RESOLVED_WKT);
+
+        for preparer in [
+            CopcNodePreparer::from_metadata(&metadata),
+            CopcNodePreparer::from_metadata_with_max_chunk_bytes(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            ),
+            CopcNodePreparer::from_metadata_with_height_offset(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+                0.0,
+            ),
+        ] {
+            let preparer = preparer.expect("legacy constructors should resolve the EVLR WKT");
+            assert!(!preparer.transform().used_horizontal_fallback());
+        }
+    }
+
+    #[test]
+    fn legacy_decoder_constructors_preserve_evlr_wkt_in_the_public_header() {
+        const RESOLVED_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+
+        let (mut metadata, _) = compressed_fixture();
+        mark_fixture_wkt_vlr_superseded(&mut metadata);
+        let prefix_length = metadata.len();
+        let metadata = append_wkt_evlr(metadata, RESOLVED_WKT);
+
+        for decoder in [
+            CopcNodeDecoder::from_metadata(&metadata),
+            CopcNodeDecoder::from_metadata_with_max_chunk_bytes(
+                &metadata,
+                crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+            ),
+        ] {
+            let decoder = decoder.expect("legacy constructors should resolve the EVLR WKT");
+            assert_eq!(decoder.header().wkt.as_deref(), Some(RESOLVED_WKT));
+        }
+
+        let prefix_decoder = CopcNodeDecoder::from_metadata_prefix_with_max_chunk_bytes(
+            &metadata[..prefix_length],
+            crate::DEFAULT_MAX_NODE_CHUNK_BYTES,
+        )
+        .expect("bounded-prefix decoder should not follow the EVLR");
+        assert_eq!(prefix_decoder.header().wkt, None);
     }
 
     #[test]

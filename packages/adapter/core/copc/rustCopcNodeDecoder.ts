@@ -299,6 +299,7 @@ export class RustCopcNodePreparer {
     loadWasm: () => Promise<CopcWasmExports> = loadCopcWasm,
     maxChunkBytes = DEFAULT_MAX_RANGE_BYTES,
     heightOffsetMeters = 0,
+    resolvedWkt?: string,
   ): Promise<RustCopcNodePreparer> {
     const maximum = resolveWasmMaxRangeBytes("[metadata]", maxChunkBytes);
     const heightOffset = resolveHeightOffsetMeters(heightOffsetMeters);
@@ -313,11 +314,30 @@ export class RustCopcNodePreparer {
       metadataPointer,
       metadataBytes.byteLength,
     ).set(metadataBytes);
+    const resolvedWktBytes =
+      resolvedWkt === undefined
+        ? undefined
+        : new TextEncoder().encode(resolvedWkt);
+    let resolvedWktPointer: number | undefined;
     try {
+      if (resolvedWktBytes !== undefined) {
+        resolvedWktPointer = requireRustWasmPointer(
+          wasm.alloc_bytes(resolvedWktBytes.byteLength),
+          resolvedWktBytes.byteLength,
+          "resolved CRS WKT",
+        );
+        new Uint8Array(
+          wasm.memory.buffer,
+          resolvedWktPointer,
+          resolvedWktBytes.byteLength,
+        ).set(resolvedWktBytes);
+      }
       const responsePointer =
-        wasm.create_copc_node_preparer_with_limit_and_height_offset_json(
+        wasm.create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
           metadataPointer,
           metadataBytes.byteLength,
+          resolvedWktPointer ?? 0,
+          resolvedWktBytes?.byteLength ?? 0,
           maximum,
           heightOffset,
         );
@@ -337,6 +357,9 @@ export class RustCopcNodePreparer {
         wasm.free_parser_json(responsePointer);
       }
     } finally {
+      if (resolvedWktPointer !== undefined && resolvedWktBytes !== undefined) {
+        wasm.dealloc_bytes(resolvedWktPointer, resolvedWktBytes.byteLength);
+      }
       wasm.dealloc_bytes(metadataPointer, metadataBytes.byteLength);
     }
   }

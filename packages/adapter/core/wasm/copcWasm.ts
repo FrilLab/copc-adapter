@@ -34,6 +34,30 @@ export type CopcWasmExports = {
     outputPointer: number,
   ): number;
   parse_copc_header_json(pointer: number, length: number): number;
+  plan_copc_metadata_layout_json(
+    pointer: number,
+    length: number,
+    maxPrefixBytes: number,
+  ): number;
+  plan_next_copc_evlr_read_json(
+    lasHeaderPointer: number,
+    lasHeaderLength: number,
+    index: number,
+    expectedHeaderOffset: bigint,
+    evlrHeaderPointer: number,
+    evlrHeaderLength: number,
+    sourceSize: bigint,
+    fetchedWktBytes: bigint,
+    maxWktBytes: number,
+  ): number;
+  parse_copc_metadata_json(
+    prefixPointer: number,
+    prefixLength: number,
+    directoryPointer: number,
+    directoryLength: number,
+    sourceSize: bigint,
+    maxWktBytes: number,
+  ): number;
   parse_root_hierarchy_json(pointer: number, length: number): number;
   parse_root_hierarchy_with_limit_json(
     pointer: number,
@@ -114,6 +138,14 @@ export type CopcWasmExports = {
   create_copc_node_preparer_with_limit_and_height_offset_json(
     pointer: number,
     length: number,
+    maxChunkBytes: number,
+    heightOffsetMeters: number,
+  ): number;
+  create_copc_node_preparer_with_limit_and_height_offset_and_wkt_json(
+    metadataPointer: number,
+    metadataLength: number,
+    resolvedWktPointer: number,
+    resolvedWktLength: number,
     maxChunkBytes: number,
     heightOffsetMeters: number,
   ): number;

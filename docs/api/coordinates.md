@@ -11,9 +11,23 @@ international and US survey feet), explicit horizontal axis order, WKT1/WKT2
 metadata syntax support, evidence provenance, and stable reason codes.
 `heightKind` is `ellipsoidal`, `gravity-related/orthometric`, or
 `local/unknown`, with an `explicit`, `inferred`, or `unknown` certainty.
-Both readers choose the first WKT VLR and use the first WKT EVLR only when no
-VLR WKT exists. If multiple WKT records disagree, the diagnostic reports
-`conflicting-source-wkt` and retains the first value under that precedence.
+Both readers identify CRS records by the LAS `LASF_Projection` user ID and
+record ID 2112. The first active WKT VLR takes precedence over EVLRs; when no
+active VLR exists, the first WKT EVLR is selected. A WKT record rewritten as
+`LASF_Spec` record ID 7 is superseded and is not considered an active CRS
+record, so a replacement EVLR can supply the selected value. Selection follows
+record identity and LAS supersession semantics; decoded WKT text is compared
+to report conflicts, not to choose the source. If multiple active WKT records
+differ, the diagnostic reports `conflicting-source-wkt` and retains the first
+value under that precedence.
+
+The Rust reader parses header, VLR, COPC Info, LASZIP, Extra Bytes, and WKT
+metadata in Rust. Its TypeScript range adapter fetches the bounded header/VLR
+prefix, sequential EVLR headers, and only WKT EVLR payloads. Other EVLR payloads
+stay remote. When the byte source reports its size, Rust validates every
+declared EVLR range, including payloads that were not fetched. EVLR traversal is
+limited to 4,096 records, and fetched WKT EVLR payloads together cannot exceed
+the configured range-byte limit.
 
 The resolver does not infer a CRS or height reference from coordinate ranges,
 country, output labels, or transformed WGS84/ECEF values. Missing or

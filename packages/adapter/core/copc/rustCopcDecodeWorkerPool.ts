@@ -226,6 +226,7 @@ export class RustCopcDecodeWorkerPool {
   private readonly creatingEntries = new Set<QueueEntry>();
   private creatingSlots = 0;
   private metadata?: Uint8Array;
+  private resolvedWkt?: string;
   private nextId = 1;
   private destroyed = false;
   private submittedCount = 0;
@@ -251,10 +252,11 @@ export class RustCopcDecodeWorkerPool {
     this.workerFactory = options.workerFactory ?? defaultWorkerFactory;
   }
 
-  /** Copy parsed source metadata to workers before point jobs are submitted. */
-  setMetadata(metadata: Uint8Array): void {
+  /** Copy the metadata prefix and resolved CRS WKT to workers. */
+  setMetadata(metadata: Uint8Array, resolvedWkt?: string): void {
     if (this.destroyed) return;
     this.metadata = metadata.slice();
+    this.resolvedWkt = resolvedWkt;
   }
 
   /** Submit a worker-side decode and return source-space coordinates and attributes. */
@@ -553,6 +555,9 @@ export class RustCopcDecodeWorkerPool {
           {
             type: "init",
             metadata,
+            ...(this.resolvedWkt !== undefined
+              ? { resolvedWkt: this.resolvedWkt }
+              : {}),
             wasm,
             maxRangeBytes: this.maxRangeBytes,
             heightOffsetMeters: this.heightOffsetMeters,

@@ -1,10 +1,14 @@
 use crate::binary::{ensure_range, read_f64, read_u16, read_u32, read_u64};
 use crate::error::{CopcError, Result};
 use crate::extra_bytes::{ExtraBytesDescriptor, parse_extra_bytes_descriptors};
-use crate::vlr::{VlrVisit, for_each_evlr, for_each_vlr};
+use crate::vlr::{
+    VlrVisit, for_each_evlr, for_each_vlr, parse_laz_vlr_payload, validate_laz_record_length,
+};
+use laz::LazVlr;
 
 const LAS_HEADER_SIZE: usize = 375;
 const COPC_INFO_SIZE: usize = 160;
+pub(crate) const MAX_EVLRS: u32 = 4096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopcHeader {
@@ -24,6 +28,83 @@ pub struct CopcHeader {
     pub extra_dimensions: Vec<ExtraBytesDescriptor>,
 }
 
+/// Source class selected for LAS coordinate-system WKT metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrsWktSource {
+    /// No WKT record was found.
+    Unknown,
+    /// A VLR supplied the selected WKT.
+    Vlr,
+    /// An EVLR supplied the selected WKT.
+    Evlr,
+}
+
+impl CrsWktSource {
+    /// Stable lowercase representation used by host adapters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Vlr => "vlr",
+            Self::Evlr => "evlr",
+        }
+    }
+}
+
+/// Provenance retained while resolving WKT from LAS VLR and EVLR records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrsWktProvenance {
+    /// Source class of the selected WKT value, if any.
+    pub selected: CrsWktSource,
+    /// Source classes that contained one or more WKT records, in file order.
+    pub available: Vec<CrsWktSource>,
+    /// Whether any available WKT value differs from the selected value.
+    pub conflicting: bool,
+}
+
+/// Header and CRS provenance produced by the authoritative metadata parser.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedCopcMetadata {
+    /// Validated LAS/COPC fields and Extra Bytes descriptors.
+    pub header: CopcHeader,
+    /// WKT selection and conflict evidence from VLRs and EVLRs.
+    pub crs_wkt_provenance: CrsWktProvenance,
+}
+
+/// One EVLR header fetched by the host adapter, with its actual source offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedEvlr<'a> {
+    /// Absolute offset of this EVLR header in the LAS source.
+    pub offset: u64,
+    /// Raw 60-byte EVLR header as fetched from the source.
+    pub header: &'a [u8],
+    /// Selectively fetched payload. Present only for WKT EVLR records.
+    pub payload: Option<&'a [u8]>,
+}
+
+/// Layout information used by a host adapter to fetch bounded metadata ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopcMetadataLayout {
+    /// LAS public header length, including any declared extension bytes.
+    pub header_size: usize,
+    /// Offset to point records and end of the VLR prefix.
+    pub point_data_offset: usize,
+    /// Absolute offset of the first EVLR, or zero when there are none.
+    pub first_evlr_offset: u64,
+    /// Number of EVLR headers declared by LAS 1.4.
+    pub evlr_count: u32,
+}
+
+/// Result of inspecting one raw EVLR header before selectively fetching payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvlrReadPlan {
+    /// Offset for the next EVLR header, if one is declared.
+    pub next_header_offset: Option<u64>,
+    /// Absolute offset of this EVLR's payload.
+    pub payload_offset: u64,
+    /// Payload size to fetch when this record contains WKT; otherwise `None`.
+    pub wkt_payload_length: Option<u64>,
+}
+
 struct CopcInfo {
     center: [f64; 3],
     half_size: f64,
@@ -32,7 +113,12 @@ struct CopcInfo {
     root_length: u64,
 }
 
-pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
+/// Parse LAS/COPC header and VLR metadata without following remote EVLR ranges.
+///
+/// This function accepts a bounded prefix ending at `point_data_offset`. EVLR
+/// headers and selectively fetched EVLR payloads are handled by
+/// [`crate::parse_copc_metadata`].
+pub fn parse_header_prefix(bytes: &[u8]) -> Result<CopcHeader> {
     ensure_range(bytes, 0, LAS_HEADER_SIZE, "LAS 1.4 header")?;
     if &bytes[0..4] != b"LASF" {
         return Err(CopcError::new(
@@ -91,9 +177,25 @@ pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
 
     let point_data_record_format = bytes[104] & 0x0f;
     let point_data_record_length = read_u16(bytes, 105, "point data record length")?;
+    let base_record_length = match point_data_record_format {
+        0 => Some(20),
+        1 => Some(28),
+        2 => Some(26),
+        3 => Some(34),
+        4 => Some(57),
+        5 => Some(63),
+        6 => Some(30),
+        7 => Some(36),
+        8 => Some(38),
+        9 => Some(59),
+        10 => Some(67),
+        _ => None,
+    };
     let mut copc_info: Option<CopcInfo> = None;
     let mut wkt: Option<String> = None;
     let mut wkt_record_found = false;
+    let mut copc_info_found = false;
+    let mut laz_vlr_found = false;
     let mut extra_bytes_payloads: Vec<Vec<u8>> = Vec::new();
 
     for_each_vlr(
@@ -104,6 +206,13 @@ pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
         "VLR payload offset overflows the input",
         |record_user_id, record_id, payload| {
             if record_user_id == "copc" && record_id == 1 {
+                if copc_info_found {
+                    return Err(CopcError::new(
+                        "duplicate-record",
+                        "COPC info VLR occurs more than once",
+                    ));
+                }
+                copc_info_found = true;
                 if payload.len() != COPC_INFO_SIZE {
                     return Err(CopcError::new(
                         "malformed-copc-info",
@@ -124,6 +233,28 @@ pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
                     root_offset: read_u64(payload, 40, "root hierarchy page offset")?,
                     root_length: read_u64(payload, 48, "root hierarchy page length")?,
                 });
+            }
+
+            if record_user_id == LazVlr::USER_ID && record_id == LazVlr::RECORD_ID {
+                if laz_vlr_found {
+                    return Err(CopcError::new(
+                        "duplicate-record",
+                        "LASZIP VLR occurs more than once",
+                    ));
+                }
+                laz_vlr_found = true;
+                if base_record_length
+                    .is_some_and(|minimum| usize::from(point_data_record_length) < minimum)
+                {
+                    return Err(CopcError::new(
+                        "unsupported-point-format",
+                        "LAS point record is shorter than its format-defined fields",
+                    ));
+                }
+                let laz_vlr = parse_laz_vlr_payload(payload)?;
+                if matches!(point_data_record_format, 6..=8) {
+                    validate_laz_record_length(&laz_vlr, point_data_record_length)?;
+                }
             }
 
             if record_user_id == "LASF_Projection" && record_id == 2112 {
@@ -150,64 +281,12 @@ pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
         },
     )?;
 
-    let evlr_offset = read_u64(bytes, 235, "first EVLR offset")?;
-    let evlr_count = read_u32(bytes, 243, "number of EVLRs")? as usize;
-    if evlr_count > 0 {
-        if evlr_offset == 0 {
-            return Err(CopcError::new(
-                "invalid-header",
-                "LAS declares EVLRs without a valid first EVLR offset",
-            ));
-        }
-        let evlr_offset = usize::try_from(evlr_offset)
-            .map_err(|_| CopcError::new("unsupported-value", "EVLR offset is too large"))?;
-        for_each_evlr(
-            bytes,
-            evlr_offset,
-            evlr_count,
-            |record_user_id, record_id, payload| {
-                if record_user_id == "LASF_Projection" && record_id == 2112 {
-                    if wkt_record_found {
-                        return Ok(VlrVisit::Stop);
-                    }
-                    wkt_record_found = true;
-                    let end = payload
-                        .iter()
-                        .position(|byte| *byte == 0)
-                        .unwrap_or(payload.len());
-                    let value = String::from_utf8(payload[..end].to_vec()).map_err(|_| {
-                        CopcError::new("malformed-wkt", "WKT EVLR is not valid UTF-8")
-                    })?;
-                    if !value.is_empty() {
-                        wkt = Some(value);
-                    }
-                    return Ok(VlrVisit::Stop);
-                }
-                Ok(VlrVisit::Continue)
-            },
-        )?;
-    }
-
     let copc_info = copc_info.ok_or_else(|| {
         CopcError::new(
             "missing-copc-info",
             "COPC info VLR (user ID copc, record ID 1) was not found",
         )
     })?;
-    let base_record_length = match point_data_record_format {
-        0 => Some(20),
-        1 => Some(28),
-        2 => Some(26),
-        3 => Some(34),
-        4 => Some(57),
-        5 => Some(63),
-        6 => Some(30),
-        7 => Some(36),
-        8 => Some(38),
-        9 => Some(59),
-        10 => Some(67),
-        _ => None,
-    };
     let extra_dimensions = if extra_bytes_payloads.is_empty() {
         Vec::new()
     } else {
@@ -284,6 +363,103 @@ pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
         root_hierarchy_page_length: root_length,
         wkt,
         extra_dimensions,
+    })
+}
+
+/// Parse a complete in-memory LAS/COPC source, including all EVLR records.
+///
+/// Range-based readers should use [`parse_header_prefix`] and
+/// [`crate::parse_copc_metadata`] so they never need to load the EVLR section
+/// as a single buffer.
+pub fn parse_header(bytes: &[u8]) -> Result<CopcHeader> {
+    let header = parse_header_prefix(bytes)?;
+    let layout = copc_metadata_layout(bytes, usize::MAX)?;
+    if layout.evlr_count == 0 {
+        return Ok(header);
+    }
+
+    let mut records = Vec::with_capacity(layout.evlr_count as usize);
+    let mut position = layout.first_evlr_offset;
+    for_each_evlr(
+        bytes,
+        usize::try_from(position)
+            .map_err(|_| CopcError::new("unsupported-value", "EVLR offset is too large"))?,
+        layout.evlr_count as usize,
+        |user_id, record_id, payload| {
+            let start = usize::try_from(position)
+                .map_err(|_| CopcError::new("unsupported-value", "EVLR offset is too large"))?;
+            let header_end = start
+                .checked_add(60)
+                .ok_or_else(|| CopcError::new("overflow", "EVLR header range overflows"))?;
+            ensure_range(bytes, start, 60, "EVLR header")?;
+            let header = &bytes[start..header_end];
+            records.push(FetchedEvlr {
+                offset: position,
+                header,
+                payload: if user_id == "LASF_Projection" && record_id == 2112 {
+                    Some(payload)
+                } else {
+                    None
+                },
+            });
+            position = position
+                .checked_add(60)
+                .and_then(|value| value.checked_add(payload.len() as u64))
+                .ok_or_else(|| CopcError::new("overflow", "EVLR payload end overflows"))?;
+            Ok(VlrVisit::Continue)
+        },
+    )?;
+    crate::parse_copc_metadata(bytes, &records, None, usize::MAX).map(|parsed| parsed.header)
+}
+
+/// Read bounded LAS metadata layout fields from an initial header prefix.
+pub fn copc_metadata_layout(bytes: &[u8], max_prefix_bytes: usize) -> Result<CopcMetadataLayout> {
+    ensure_range(bytes, 0, LAS_HEADER_SIZE, "LAS 1.4 header")?;
+    if &bytes[0..4] != b"LASF" || bytes[24] != 1 || bytes[25] != 4 {
+        return Err(CopcError::new(
+            "invalid-header",
+            "input is not a LAS 1.4 header",
+        ));
+    }
+    let header_size = usize::from(read_u16(bytes, 94, "header size")?);
+    let point_data_offset = read_u32(bytes, 96, "point data offset")? as usize;
+    if header_size < LAS_HEADER_SIZE || point_data_offset < header_size {
+        return Err(CopcError::new(
+            "invalid-header",
+            "LAS header or VLR offset is invalid",
+        ));
+    }
+    if point_data_offset > max_prefix_bytes {
+        return Err(CopcError::new(
+            "unsupported-value",
+            "LAS metadata prefix exceeds the configured byte limit",
+        ));
+    }
+    let first_evlr_offset = read_u64(bytes, 235, "first EVLR offset")?;
+    let evlr_count = read_u32(bytes, 243, "number of EVLRs")?;
+    if evlr_count > MAX_EVLRS {
+        return Err(CopcError::new(
+            "unsupported-value",
+            format!("LAS EVLR count exceeds the {MAX_EVLRS}-record safety limit"),
+        ));
+    }
+    if evlr_count > 0 && first_evlr_offset == 0 {
+        return Err(CopcError::new(
+            "invalid-header",
+            "LAS declares EVLRs without a valid first EVLR offset",
+        ));
+    }
+    if evlr_count > 0 && first_evlr_offset < point_data_offset as u64 {
+        return Err(CopcError::new(
+            "invalid-header",
+            "first EVLR offset precedes the LAS point data area",
+        ));
+    }
+    Ok(CopcMetadataLayout {
+        header_size,
+        point_data_offset,
+        first_evlr_offset,
+        evlr_count,
     })
 }
 

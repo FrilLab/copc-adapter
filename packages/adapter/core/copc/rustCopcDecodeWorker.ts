@@ -8,6 +8,7 @@ import type { RustCopcDecodeWorkerRequest } from "./rustCopcDecodeWorkerProtocol
 import { DEFAULT_MAX_RANGE_BYTES } from "./range/types";
 
 let metadataBytes: Uint8Array | undefined;
+let resolvedWkt: string | undefined;
 let wasmBinary: Uint8Array | undefined;
 let nodePreparer: RustCopcNodePreparer | undefined;
 let maxRangeBytes = DEFAULT_MAX_RANGE_BYTES;
@@ -26,6 +27,7 @@ workerScope.onmessage = async (
       nodePreparer?.dispose();
       nodePreparer = undefined;
       metadataBytes = new Uint8Array(request.metadata);
+      resolvedWkt = request.resolvedWkt;
       wasmBinary = new Uint8Array(request.wasm);
       maxRangeBytes = request.maxRangeBytes;
       heightOffsetMeters = request.heightOffsetMeters;
@@ -49,6 +51,7 @@ workerScope.onmessage = async (
           () => Promise.resolve(wasm),
           maxRangeBytes,
           heightOffsetMeters,
+          resolvedWkt,
         );
       }
       const result = nodePreparer.prepare(

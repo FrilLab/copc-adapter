@@ -17,6 +17,7 @@ mod extra_bytes;
 mod header;
 mod hierarchy;
 mod interleave;
+mod metadata;
 mod preparation;
 mod vlr;
 
@@ -33,12 +34,16 @@ pub use decoder::{
 };
 pub use error::{CopcError, Result};
 pub use extra_bytes::{ExtraBytesDescriptor, ExtraBytesPrimitive, ExtraBytesValue};
-pub use header::{CopcHeader, parse_header};
+pub use header::{
+    CopcHeader, CopcMetadataLayout, CrsWktProvenance, CrsWktSource, EvlrReadPlan, FetchedEvlr,
+    ParsedCopcMetadata, copc_metadata_layout, parse_header, parse_header_prefix,
+};
 pub use hierarchy::{
     RootHierarchy, RootHierarchyNode, RootHierarchyPage, parse_root_hierarchy,
     parse_root_hierarchy_with_max_bytes,
 };
 pub use interleave::interleave_xyz;
+pub use metadata::{parse_copc_metadata, plan_next_evlr_read};
 pub use preparation::{
     CopcNodePreparer, PreparedCopcNode, PreparedCopcNodeWithExtraDimensions, PreparedPointRange,
     PreparedPointStatistics,

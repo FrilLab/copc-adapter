@@ -9,6 +9,8 @@ export type RustCopcDecodeWorkerInit = {
   type: "init";
   /** Serialized COPC metadata transferred to the worker. */
   metadata: ArrayBuffer;
+  /** WKT resolved from VLR/EVLR metadata, when present. */
+  resolvedWkt?: string;
   /** Package-owned Rust/WASM module bytes transferred to the worker. */
   wasm: ArrayBuffer;
   /** Maximum range/chunk size accepted by the worker, in bytes. */
