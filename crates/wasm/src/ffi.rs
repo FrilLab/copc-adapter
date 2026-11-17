@@ -3,7 +3,7 @@ use copc_adapter_core::{
     DecodedExtraDimension, DecodedExtraDimensionValues, EvlrReadPlan, ExtraBytesPrimitive,
     FetchedEvlr, PreparedCopcNode, PreparedCopcNodeWithExtraDimensions, RootHierarchy,
     copc_metadata_layout, decode_copc_node, decode_copc_node_with_extra_dimensions,
-    decode_copc_node_with_max_chunk_bytes, interleave_xyz, parse_copc_metadata,
+    decode_copc_node_with_max_chunk_bytes, interleave_xyz, parse_copc_metadata, parse_header,
     parse_header_prefix, parse_root_hierarchy, parse_root_hierarchy_with_max_bytes,
     plan_next_evlr_read,
 };
@@ -506,7 +506,7 @@ fn copy_extra_dimensions(
 }
 
 fn parse_header_value(bytes: &[u8]) -> Result<CopcHeaderJson, ParseError> {
-    parse_header_prefix(bytes)
+    parse_header(bytes)
         .map_err(from_core)
         .and_then(|header| header_json(header, None))
 }

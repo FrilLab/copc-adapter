@@ -192,6 +192,18 @@ test("legacy Rust WASM preparer exports resolve WKT from complete EVLR metadata"
   ];
 
   try {
+    const headerResponsePointer = wasm.parse_copc_header_json(
+      metadataPointer,
+      metadata.byteLength,
+    );
+    try {
+      const response = readParserResponse(wasm, headerResponsePointer);
+      assert.equal(response.ok, true, response.error?.message);
+      assert.equal(response.value.wkt, RESOLVED_WKT);
+    } finally {
+      wasm.free_parser_json(headerResponsePointer);
+    }
+
     for (const createPreparer of createPreparers) {
       const responsePointer = createPreparer();
       try {
