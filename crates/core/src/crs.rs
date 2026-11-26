@@ -769,6 +769,9 @@ fn parse_linear_unit_scale(unit: &str) -> Result<f64> {
         ));
     };
     let mut cursor = open + 1;
+    while cursor < unit.len() && unit.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
     if unit.as_bytes().get(cursor) != Some(&b'"') {
         return Err(CopcError::new(
             "malformed-wkt",
@@ -793,6 +796,9 @@ fn parse_linear_unit_scale(unit: &str) -> Result<f64> {
         ));
     }
     cursor += 1;
+    while cursor < unit.len() && unit.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
     if unit.as_bytes().get(cursor) != Some(&b',') {
         return Err(CopcError::new(
             "malformed-wkt",
@@ -980,6 +986,26 @@ mod tests {
                 .code(),
             "unsupported-axis"
         );
+    }
+
+    #[test]
+    fn accepts_whitespace_around_wkt2_three_dimensional_height_unit_names() {
+        for spaced_unit_wkt in [
+            WGS84_GEOGRAPHIC_3D_US_FOOT_WKT.replace(
+                "LENGTHUNIT[\"US survey foot\",",
+                "LENGTHUNIT[ \"US survey foot\",",
+            ),
+            WGS84_GEOGRAPHIC_3D_US_FOOT_WKT.replace(
+                "LENGTHUNIT[\"US survey foot\",",
+                "LENGTHUNIT[\"US survey foot\" ,",
+            ),
+        ] {
+            let transform = CrsTransform::from_wkt(&spaced_unit_wkt).unwrap();
+            let point = transform
+                .transform_point([45.5231, -122.6784, 100.0])
+                .unwrap();
+            assert!((point.height - 100.0 * 0.304800609601219).abs() < 1e-12);
+        }
     }
 
     #[test]
