@@ -119,6 +119,119 @@ The synthetic WKT2 grid row validates the conversion pipeline, axis handling,
 and browser/runtime parity; it is not a model accuracy check. The existing
 NGA EGM2008 profile retains its separate official-grid control evidence.
 
+## Rust CRS and prepared-point parity
+
+This records the supported scope and measurements for issue #467. The native
+and WASM Rust implementations use the same CRS core; the fused node preparer
+also uses that core before returning the shared prepared-point contract.
+
+### Supported and excluded source cases
+
+| Source case | Horizontal behavior | Height behavior | Decision |
+| --- | --- | --- | --- |
+| WKT1 GEOGCS and projected PROJCS | Geographic degrees or a supported projected definition; explicit horizontal axes are normalized by order and cardinal direction | Explicit VERT_CS units are converted to metres; absent vertical metadata retains the established metre compatibility default and is reported as local/unknown | Supported for the checked fixture shapes |
+| WKT1 COMPD_CS: Autzen EPSG:2992 + EPSG:6360 | Lambert Conformal Conic inverse matches the proj4js reference | US survey feet convert by 0.304800609601219; height remains NAVD88 because no verified compatible datum operation is configured | Horizontal/unit support only; no NAVD88 conversion |
+| WKT1 COMPD_CS: SoFi WGS 84 / UTM 11N | Projected component transforms and matches proj4js | Explicit vertical unit is preserved | Supported through Rust’s visible projected-component WKT compatibility path; full compound conversion remains a proj4wkt parser gap |
+| WKT2 PROJCRS and COMPOUNDCRS with VERTCRS | Two horizontal axes are normalized from declared order and east/west, north/south direction | Explicit vertical units are converted; only an UP vertical axis is accepted | Supported for the checked fixture shapes |
+| WKT2 root 3D GEOGCRS or PROJCRS | Two horizontal axes follow their declared order | The third axis must be UP and declare an explicit LENGTHUNIT; the unit is converted before a manual offset | Supported and covered by WGS 84 geographic and UTM projected 3D controls |
+| EPSG:5186 KGD2002 / Central Belt 2010 | EPSG definition and independent natural-origin / Seoul controls agree; source X/Y are easting/northing for this adapter | No vertical CRS is declared; Z remains local/unknown and no Korean geoid operation is inferred | Horizontal support only |
+| Missing projected WKT, malformed/conflicting vertical units, unsupported axis direction, or WKT that proj4rs cannot initialize | No inferred projection or hidden JavaScript fallback | A DOWN axis is rejected; no sign inversion is guessed | Deterministic error |
+
+The checked-in audit fixtures cover WKT1 geographic, projected and compound
+forms; WKT2 projected and compound forms; east/north and north/east source
+order; vertical unit conversion; Autzen, SoFi and EPSG:5186 controls. Separate
+tests cover WKT2 3D height units, source XYZ retention, manual offset ordering,
+and DOWN-axis rejection. Missing/contradictory VLR/EVLR selection remains
+owned by the metadata authority rules from issue #477; CRS diagnostics do not
+invent a datum operation.
+
+The configured vertical grid is still a caller-supplied operation. Only the
+pinned EGM2008 EPSG:3855 to WGS 84 ellipsoidal EPSG:4979 profile is registered
+by the documented model policy. Autzen NAVD88 remains blocked on source-frame
+and epoch evidence, and KNGeoid24/KNGeoid18 remain unsupported. A unit
+conversion or matching horizontal coordinates do not establish vertical datum
+equivalence. The manual height offset is applied after unit conversion and an
+optional validated grid, and it is applied once.
+
+### Differential fixture results
+
+The audit compares native Rust against the proj4js reference using identical
+source tuples, axis normalization, and vertical unit factors. Reported maxima
+are absolute errors for one deterministic run of the checked fixture points.
+The EPSG:5186 expected values come from PROJ 9.8.1 / EPSG Dataset 12.029
+controls recorded with that fixture; they check software conformance, not
+survey accuracy.
+
+| Fixture | Points | Max longitude error (degrees) | Max latitude error (degrees) | Max height error (m) | Independent control |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Autzen WKT1 compound LCC | 4 | 0 | 2.85e-14 | 0 | Horizontal provenance only |
+| SoFi WKT1 compound UTM 11N | 4 | 2.85e-14 | 1.43e-14 | 0 | Horizontal provenance only |
+| WGS 84 WKT1 geographic | 4 | 0 | 0 | 0 | Identity geographic control |
+| UTM 11N WKT2 PROJCRS | 4 | 4.27e-14 | 1.43e-14 | 0 | Differential only |
+| UTM 11N + EGM2008 WKT2 compound | 1 | 2.85e-14 | 0 | 0 | Geographic control |
+| WGS 84 + EGM2008 WKT2 geographic compound | 1 | 2.85e-14 | 0 | 0 | Geographic control |
+| EPSG:5186 KGD2002 / Central Belt 2010 | 2 | 0 | 7.11e-15 | 0 | Independent geographic and ECEF controls |
+
+The fixture tolerances are 1e-7 degrees and 1e-9 m for projected/compound
+controls, with 1e-12 degree and metre identity tolerance for the WKT1
+geographic identity case. EPSG:5186 also checks ECEF to 0.05 m. The native
+Rust, Rust/WASM CRS API, TypeScript reference, and fused Rust node tests pass
+these controls. The Rust/WASM fixture test checks every checked-in case;
+additional WKT2 3D tests compare geographic output, ECEF, converted feet, and
+a single manual offset. The fused preparer test also compares source,
+geographic, ECEF, aliases, RGB/intensity/classification, and statistics.
+
+### Local cold-start and repeated-transform measurements
+
+Recorded on 2026-11-26 with Node.js 26.12.1, rustc 1.92.0, arm64 macOS using
+the existing scripts/crs-audit.mjs benchmark. Each row repeats one initialized
+transform over 500,000 deterministic Autzen or SoFi source tuples five times;
+the reported repeated-transform value is the five-run total divided by five.
+Initialization is measured separately for each implementation. The WASM
+module was imported before its per-CRS initialization timer, so module fetch,
+compile, and instantiation are excluded.
+
+| Fixture | Implementation | CRS initialization (ms) | Repeated CRS transform (ms/call) | Reported output buffers |
+| --- | --- | ---: | ---: | --- |
+| Autzen | Native Rust | 0.040 | 191.2 | 24 MB geographic + ECEF |
+| Autzen | proj4js | 0.329 | 301.0 | 12 MB geographic |
+| Autzen | Rust/WASM | 0.200 | 413.4 | 12 MB geographic |
+| SoFi | Native Rust | 0.055 | 63.5 | 24 MB geographic + ECEF |
+| SoFi | proj4js | 0.309 | 227.2 | 12 MB geographic |
+| SoFi | Rust/WASM | 0.236 | 125.2 | 12 MB geographic |
+
+The optimized CRS audit WASM was 896,508 bytes. The native Rust row uses the
+combined geographic-plus-ECEF operation, while the JavaScript and standalone
+WASM benchmark rows emit geographic triples only; these durations are not a
+like-for-like end-to-end preparation comparison. Buffer sizes are the
+benchmark’s reported typed-output sizes, not peak resident memory. This single
+local run has no warmup protocol or repeated process-level samples, and it
+does not include point decoding, Worker transfer, grid sampling, renderer
+upload, or browser memory. The results show fixture-dependent performance:
+native Rust is faster than proj4js for both samples, while standalone WASM is
+slower for Autzen and faster for SoFi. No precision mismatch was found within
+the documented fixture tolerances.
+
+Validation for this parity closure:
+
+- `cargo test --workspace` — 52 core, 8 WASM, and 4 CRS audit tests passed;
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `npm run audit:crs -- --benchmark --wasm --json` — all seven differential
+  fixtures passed, with the documented SoFi full-compound parser gap visible.
+- `npm test -w @frillab/copc-adapter` — 683 passed; package typecheck and
+  `npm run prepare-copc-adapter-wasm` passed.
+- Rust/WASM fixture and 3D-axis tests, plus fused-node attributes, statistics,
+  offset, and source-retention tests — passed.
+- Cesium vertical-grid browser suite — 4 passed and its benchmark-only case
+  skipped; it covered the Rust/WASM Worker and non-Worker comparisons.
+- `npm run test:pack` — root production, explicit Cesium production, and root
+  development consumers each passed 13 Chromium checks with one benchmark-only
+  skip. `npm run test:pack:core` and `npm run test:pack:three` passed; the Three
+  consumer rendered and picked 219,951 Rust-prepared points, then destroyed
+  the layer while preserving the caller renderer and scene object. Its packed
+  browser launch explicitly enables SwiftShader for stable headless WebGL.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
 The first prioritized validation target is the public Autzen COPC. The existing
 CRS fixture retains its real compound WKT, and now also records the values read
 from the LAS 1.4 header. The object is 81,123,042 bytes with SHA-256

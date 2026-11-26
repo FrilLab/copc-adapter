@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import { RustCrsTransformer } from "../../../../core/coordinates/transform/rustCrsTransformer.ts";
 import { createPointTransformer } from "../../../../core/coordinates/transform/createPointTransformer.ts";
@@ -15,8 +16,16 @@ import {
 } from "../../../../core/coordinates/transform/createPointTransformer.ts";
 import { loadGtxGeoidGrid } from "../../../../core/coordinates/transform/verticalGrid.ts";
 
+const CRS_FIXTURES = JSON.parse(
+  readFileSync(
+    new URL("../../../../../../crates/crs-audit/src/fixtures.json", import.meta.url),
+    "utf8",
+  ),
+).fixtures;
 const WGS84_GEOGRAPHIC_WKT =
   'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]';
+const WGS84_GEOGRAPHIC_3D_US_FOOT_WKT =
+  'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,3],AXIS["geodetic latitude (Lat)",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic longitude (Lon)",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],AXIS["ellipsoidal height (h)",up,ORDER[3],LENGTHUNIT["US survey foot",0.304800609601219]],ID["EPSG",4979]]';
 
 test("Rust CRS WASM worker loader supplies the proj4rs imports", async () => {
   const wasm = await loadCopcWasmWorker(await getCopcWasmBinary());
@@ -229,5 +238,148 @@ test("Rust/WASM and JavaScript agree on foot units after one shared synthetic ge
     }
   } finally {
     rustTransformer.dispose();
+  }
+});
+
+test("Rust/WASM CRS transforms match the checked-in WKT and authoritative controls", async () => {
+  for (const fixture of CRS_FIXTURES) {
+    const sourceCoordinates = new Float64Array(
+      fixture.points.flatMap(({ x, y, z }) => [x, y, z]),
+    );
+    const xs = fixture.points.map(({ x }) => x);
+    const ys = fixture.points.map(({ y }) => y);
+    const zs = fixture.points.map(({ z }) => z);
+    const metadata = {
+      wkt: fixture.wkt,
+      bounds: {
+        minX: Math.min(...xs),
+        minY: Math.min(...ys),
+        minZ: Math.min(...zs),
+        maxX: Math.max(...xs),
+        maxY: Math.max(...ys),
+        maxZ: Math.max(...zs),
+      },
+    };
+    const rust = await RustCrsTransformer.fromMetadata(metadata);
+    try {
+      const actual = rust.transform(sourceCoordinates);
+      const reference = transformPointBufferToPreparedPointData(metadata, {
+        pointCount: fixture.points.length,
+        coordinateSystem: "copc-source",
+        coordinates: sourceCoordinates,
+      });
+      const tolerance = fixture.tolerance;
+      const ecefTolerance = fixture.ecef_tolerance_meters ?? 1e-6;
+
+      assert.deepEqual(
+        [...reference.source.coordinates],
+        [...sourceCoordinates],
+        fixture.id + " retains the source XYZ tuples",
+      );
+      for (let index = 0; index < fixture.points.length; index += 1) {
+        const offset = index * 3;
+        const expected = fixture.expected?.[index];
+        const comparisons = [
+          [0, "longitude", tolerance.longitude_degrees],
+          [1, "latitude", tolerance.latitude_degrees],
+          [2, "height", tolerance.height_meters],
+        ];
+        for (const [axis, key, limit] of comparisons) {
+          assert.ok(
+            Math.abs(actual.geographicCoordinates[offset + axis] - reference.geographic.coordinates[offset + axis]) <= limit,
+            fixture.id + " Rust/TypeScript " + key + " parity for point " + index,
+          );
+          if (expected) {
+            assert.ok(
+              Math.abs(actual.geographicCoordinates[offset + axis] - expected[key]) <= limit,
+              fixture.id + " authoritative " + key + " control for point " + index,
+            );
+          }
+        }
+        for (let axis = 0; axis < 3; axis += 1) {
+          assert.ok(
+            Math.abs(actual.ecefCoordinates[offset + axis] - reference.world.coordinates[offset + axis]) <= ecefTolerance,
+            fixture.id + " Rust/TypeScript ECEF axis " + axis + " parity for point " + index,
+          );
+          if (expected?.ecef) {
+            assert.ok(
+              Math.abs(actual.ecefCoordinates[offset + axis] - expected.ecef[axis]) <= ecefTolerance,
+              fixture.id + " authoritative ECEF axis " + axis + " control for point " + index,
+            );
+          }
+        }
+      }
+      assert.equal(
+        actual.usedHorizontalFallback,
+        fixture.id === "sofi-wkt1-compound-utm11",
+        fixture.id + " exposes the expected internal WKT compatibility path",
+      );
+    } finally {
+      rust.dispose();
+    }
+  }
+});
+
+test("Rust/WASM and JavaScript agree on explicit WKT2 3D height axes", async () => {
+  const projectedFixture = CRS_FIXTURES.find(
+    ({ id }) => id === "utm11-wkt2-projcrs",
+  );
+  assert.ok(projectedFixture);
+  const projected3dWkt = projectedFixture.wkt
+    .replace("CS[Cartesian,2]", "CS[Cartesian,3]")
+    .replace(
+      ',ID["EPSG",32611]]',
+      ',AXIS["ellipsoidal height (h)",up,ORDER[3],LENGTHUNIT["US survey foot",0.304800609601219]],ID["EPSG",32611]]',
+    );
+
+  const fixtures = [
+    {
+      wkt: WGS84_GEOGRAPHIC_3D_US_FOOT_WKT,
+      point: [45.5231, -122.6784, 100],
+      expected: [-122.6784, 45.5231, 30.4800609601219],
+      name: "geographic 3D",
+    },
+    {
+      wkt: projected3dWkt,
+      point: [376392.9975, 3757833.2855, 100],
+      expected: [-118.33772305286695, 33.95374438756227, 30.4800609601219],
+      name: "projected 3D",
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const metadata = {
+      wkt: fixture.wkt,
+      bounds: {
+        minX: fixture.point[0],
+        minY: fixture.point[1],
+        minZ: fixture.point[2],
+        maxX: fixture.point[0],
+        maxY: fixture.point[1],
+        maxZ: fixture.point[2],
+      },
+    };
+    const source = new Float64Array(fixture.point);
+    const rust = await RustCrsTransformer.fromMetadata(metadata, 4.25);
+    try {
+      const actual = rust.transform(source);
+      const reference = transformPointBufferToPreparedPointData(
+        metadata,
+        { pointCount: 1, coordinateSystem: "copc-source", coordinates: source },
+        4.25,
+      );
+      assert.deepEqual([...reference.source.coordinates], [...source]);
+      assert.ok(Math.abs(actual.geographicCoordinates[0] - fixture.expected[0]) < 1e-7, fixture.name + " longitude");
+      assert.ok(Math.abs(actual.geographicCoordinates[1] - fixture.expected[1]) < 1e-7, fixture.name + " latitude");
+      assert.ok(Math.abs(actual.geographicCoordinates[2] - (fixture.expected[2] + 4.25)) < 1e-9, fixture.name + " converted height and one manual offset");
+      for (let axis = 0; axis < 3; axis += 1) {
+        assert.ok(
+          Math.abs(actual.ecefCoordinates[axis] - reference.world.coordinates[axis]) < 1e-6,
+          fixture.name + " ECEF axis " + axis,
+        );
+      }
+    } finally {
+      rust.dispose();
+    }
   }
 });

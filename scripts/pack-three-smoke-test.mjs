@@ -421,7 +421,12 @@ if (!resolved.endsWith("/dist/three.js")) {
     ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH
       ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH }
       : {}),
-    args: ["--enable-webgl", "--ignore-gpu-blocklist", "--use-gl=swiftshader"],
+    args: [
+      "--enable-webgl",
+      "--enable-unsafe-swiftshader",
+      "--ignore-gpu-blocklist",
+      "--use-gl=swiftshader",
+    ],
   });
   const page = await consumerBrowser.newPage({
     viewport: { width: 1280, height: 720 },
