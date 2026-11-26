@@ -494,12 +494,28 @@ export function getRootCrsIdentity(wkt: string): RootCrsIdentity | undefined {
 export function extractExplicitVerticalUnitScale(wkt: string): number | undefined {
   const wkt1 = findWktSection(wkt, "VERT_CS[");
   const section = wkt1 ?? findWktSection(wkt, "VERTCRS[");
-  if (!section) return projectedUpAxisUnitScale(wkt);
+  if (!section) return threeDimensionalHeightAxisUnitScale(wkt);
   const unitKeyword = wkt1 ? "UNIT[" : "LENGTHUNIT[";
   const unitName = wkt1 ? "UNIT" : "LENGTHUNIT";
   const rootUnits = findDirectWktSections(section, [unitKeyword])
     .map(({ section: unit }) => parseLengthUnitFactor(unit, unitName));
   const axes = findDirectWktSections(section, ["AXIS["]);
+  for (const { section: axis } of axes) {
+    const direction = axis
+      .match(/^AXIS\s*\[\s*"(?:""|[^"])*"\s*,\s*"?([A-Z]+)"?/i)?.[1]
+      ?.toUpperCase();
+    if (!direction) throw new Error("COPC vertical CRS has a malformed axis declaration");
+    if (direction !== "UP") {
+      if (direction === "DOWN") {
+        throw new Error(
+          "COPC vertical WKT with a DOWN axis is unsupported because depth sign normalization is not available",
+        );
+      }
+      throw new Error(
+        "COPC vertical CRS axis direction " + direction + " is unsupported; only UP is supported",
+      );
+    }
+  }
   const axisUnits = axes.map(({ section: axis }) =>
     findDirectWktSections(axis, [unitKeyword])[0]?.section,
   );
@@ -518,10 +534,12 @@ export function extractExplicitVerticalUnitScale(wkt: string): number | undefine
   return factors[0];
 }
 
-function projectedUpAxisUnitScale(wkt: string): number | undefined {
-  if (!findWktSection(wkt, "PROJCRS[")) return undefined;
+function threeDimensionalHeightAxisUnitScale(wkt: string): number | undefined {
+  if (!findWktSection(wkt, "PROJCRS[") && !findWktSection(wkt, "GEOGCRS[")) {
+    return undefined;
+  }
   const projected = extractHorizontalCrsWkt(wkt);
-  if (!/^PROJCRS\s*\[/i.test(projected)) return undefined;
+  if (!/^(?:PROJCRS|GEOGCRS)\s*\[/i.test(projected)) return undefined;
   const direct = findDirectWktSections(projected, ["CS[", "AXIS["]);
   const coordinateSystem = direct.find(({ keyword }) => keyword === "CS[")?.section
     .match(/^CS\s*\[\s*"?([A-Z_]+)"?\s*,\s*(\d+)/i);
@@ -535,28 +553,41 @@ function projectedUpAxisUnitScale(wkt: string): number | undefined {
       return { section, direction, order };
     })
     .sort((left, right) => left.order - right.order);
-  const eastWestDirections = ["EAST", "WEST"];
-  const northSouthDirections = ["NORTH", "SOUTH"];
-  const hasEastNorthOrder = eastWestDirections.includes(axes[0]?.direction ?? "") &&
-    northSouthDirections.includes(axes[1]?.direction ?? "");
-  const hasNorthEastOrder = northSouthDirections.includes(axes[0]?.direction ?? "") &&
-    eastWestDirections.includes(axes[1]?.direction ?? "");
-  const isCartesian3d = coordinateSystem?.[1].toLowerCase() === "cartesian" &&
-    Number(coordinateSystem[2]) === 3 && axes.length === 3;
-  if (isCartesian3d && axes.some((axis) => axis.direction === "DOWN")) {
+  const isThreeDimensional = Number(coordinateSystem?.[2]) === 3 && axes.length === 3;
+  if (!isThreeDimensional) return undefined;
+  const expectedCoordinateSystem = /^PROJCRS\s*\[/i.test(projected)
+    ? "cartesian"
+    : "ellipsoidal";
+  if (coordinateSystem?.[1].toLowerCase() !== expectedCoordinateSystem) {
+    throw new Error("COPC 3D WKT declares an unsupported coordinate system type");
+  }
+  if (axes.some((axis) => axis.direction === "DOWN")) {
     throw new Error(
-      "COPC projected 3D WKT with a DOWN axis is unsupported because depth sign normalization is not available",
+      "COPC 3D WKT with a DOWN axis is unsupported because depth sign normalization is not available",
     );
   }
   if (
-    !isCartesian3d ||
-    axes[0]?.order !== 1 || axes[1]?.order !== 2 || (!hasEastNorthOrder && !hasNorthEastOrder) ||
-    axes[2]?.order !== 3 || axes[2].direction !== "UP"
-  ) return undefined;
+    axes.some((axis, index) =>
+      !Number.isSafeInteger(axis.order) ||
+      axis.order !== index + 1 ||
+      !axis.direction
+    )
+  ) {
+    throw new Error("COPC 3D WKT must declare three uniquely ordered axes");
+  }
+  const horizontalDirections = axes.slice(0, 2).map(({ direction }) => direction);
+  const eastWestDirections = ["EAST", "WEST"];
+  const northSouthDirections = ["NORTH", "SOUTH"];
+  const hasOneOfEachHorizontalDirection =
+    horizontalDirections.filter((direction) => eastWestDirections.includes(direction ?? "")).length === 1 &&
+    horizontalDirections.filter((direction) => northSouthDirections.includes(direction ?? "")).length === 1;
+  if (!hasOneOfEachHorizontalDirection || axes[2].direction !== "UP") {
+    throw new Error("COPC 3D WKT supports east/north horizontal axes and an UP height axis only");
+  }
   const unit = findDirectWktSections(axes[2].section, ["LENGTHUNIT["])[0]?.section;
   if (!unit) {
     throw new Error(
-      "COPC projected 3D WKT UP axis does not declare a LENGTHUNIT",
+      "COPC 3D WKT UP axis does not declare a LENGTHUNIT",
     );
   }
   return parseLengthUnitFactor(unit, "LENGTHUNIT");

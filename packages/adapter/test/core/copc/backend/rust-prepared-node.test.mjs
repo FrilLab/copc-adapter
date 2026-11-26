@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { RustCopcNodePreparer } from "../../../../core/copc/rustCopcNodeDecoder.ts";
 import { createCopcPointFieldSelection } from "../../../../core/copc/points/fieldSelection.ts";
+import { transformPointBufferToPreparedPointData } from "../../../../core/coordinates/transform/createPointTransformer.ts";
 import { loadCopcWasm } from "../../../../core/wasm/copcWasm.ts";
 
 const METADATA_HEX =
@@ -11,6 +12,8 @@ const CHUNK_HEX =
   "64000000c80000002c0100009001000005000000000000000000000000005802bc02200302000000060000000400000005000000000000000400000000000000000000000000000000000000070000000007dd00000004000000060000000008000000aa01aa80800000";
 const RESOLVED_WKT =
   'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]';
+const GEOGRAPHIC_3D_US_FOOT_WKT =
+  'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,3],AXIS["geodetic latitude (Lat)",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic longitude (Lon)",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],AXIS["ellipsoidal height (h)",up,ORDER[3],LENGTHUNIT["US survey foot",0.304800609601219]],ID["EPSG",4979]]';
 
 function fromHex(value) {
   return new Uint8Array(Buffer.from(value, "hex"));
@@ -129,6 +132,94 @@ test("Rust fused node preparation applies the configured ellipsoidal offset once
       [...repeated.prepared.geographic.coordinates],
       [...geographic],
     );
+  } finally {
+    preparer.dispose();
+  }
+});
+
+test("fused Rust node preparation matches 3D geographic axes, attributes and statistics", async () => {
+  const heightOffsetMeters = 4.25;
+  const preparer = await RustCopcNodePreparer.fromMetadata(
+    fromHex(METADATA_HEX),
+    undefined,
+    undefined,
+    heightOffsetMeters,
+    GEOGRAPHIC_3D_US_FOOT_WKT,
+  );
+  try {
+    const result = preparer.prepare(
+      fromHex(CHUNK_HEX),
+      2,
+      createCopcPointFieldSelection([
+        "position",
+        "intensity",
+        "classification",
+        "rgb",
+      ]),
+    );
+    const sourceCoordinates = new Float64Array([
+      11, 24, 39,
+      11.01, 24.02, 39.03,
+    ]);
+    const reference = transformPointBufferToPreparedPointData(
+      {
+        pointCount: 2,
+        bounds: {
+          minX: 11,
+          minY: 24,
+          minZ: 39,
+          maxX: 11.01,
+          maxY: 24.02,
+          maxZ: 39.03,
+        },
+        wkt: GEOGRAPHIC_3D_US_FOOT_WKT,
+      },
+      {
+        pointCount: 2,
+        coordinateSystem: "copc-source",
+        coordinates: sourceCoordinates,
+        attributes: {
+          intensity: new Uint16Array([400, 401]),
+          classification: new Uint8Array([5, 6]),
+          red: new Uint16Array([600, 601]),
+          green: new Uint16Array([700, 701]),
+          blue: new Uint16Array([800, 801]),
+        },
+      },
+      heightOffsetMeters,
+    );
+
+    assert.deepEqual([...result.prepared.source.coordinates], [...sourceCoordinates]);
+    assert.deepEqual(
+      [...result.prepared.geographic.coordinates],
+      [...reference.geographic.coordinates],
+    );
+    for (let index = 0; index < result.prepared.world.coordinates.length; index += 1) {
+      assert.ok(
+        Math.abs(result.prepared.world.coordinates[index] - reference.world.coordinates[index]) < 1e-6,
+        "fused Rust and TypeScript ECEF coordinates should match",
+      );
+    }
+    assert.deepEqual(result.prepared.statistics, reference.statistics);
+    assert.deepEqual(
+      {
+        intensity: [...result.prepared.attributes.intensity],
+        classification: [...result.prepared.attributes.classification],
+        red: [...result.prepared.attributes.red],
+        green: [...result.prepared.attributes.green],
+        blue: [...result.prepared.attributes.blue],
+      },
+      {
+        intensity: [...reference.attributes.intensity],
+        classification: [...reference.attributes.classification],
+        red: [...reference.attributes.red],
+        green: [...reference.attributes.green],
+        blue: [...reference.attributes.blue],
+      },
+    );
+    assert.equal(result.prepared.coordinates, result.prepared.geographic.coordinates);
+    assert.equal(result.prepared.sourceCoordinates, result.prepared.source.coordinates);
+    assert.equal(result.prepared.worldCoordinates, result.prepared.world.coordinates);
   } finally {
     preparer.dispose();
   }

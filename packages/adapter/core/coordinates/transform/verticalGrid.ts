@@ -613,6 +613,13 @@ export class GtxGeoidGrid {
     if (!identity) {
       fail("missing-vertical-crs", "COPC WKT does not declare a supported VERT_CS or VERTCRS", this.gridId);
     }
+    if (identity.axisDirection && identity.axisDirection !== "UP") {
+      fail(
+        "unsupported-crs-pair",
+        `Vertical axis direction ${identity.axisDirection} is not supported; geoid height conversion requires an UP axis`,
+        this.gridId,
+      );
+    }
     let verticalUnitScale: number | undefined;
     try {
       verticalUnitScale = extractExplicitVerticalUnitScale(wkt);
@@ -623,13 +630,6 @@ export class GtxGeoidGrid {
       fail(
         "unsupported-crs-pair",
         "The requested vertical conversion requires a WKT1 VERT_CS or WKT2 VERTCRS with an explicit vertical unit; no unit is assumed",
-        this.gridId,
-      );
-    }
-    if (identity.axisDirection && identity.axisDirection !== "UP") {
-      fail(
-        "unsupported-crs-pair",
-        `Vertical axis direction ${identity.axisDirection} is not supported; geoid height conversion requires an UP axis`,
         this.gridId,
       );
     }

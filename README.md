@@ -440,6 +440,9 @@ and point statistics in one job. `decodeDurationMs` and
 reference implementation and is not silently used as a Rust fallback.
 The Rust CRS path covers the validated supported WKT/CRS matrix only; full
 PROJ and vertical-datum parity is not implied.
+The supported cases, explicit exclusions, fixture tolerances, and local
+native/JavaScript/WASM measurements are recorded in the
+[CRS and vertical-transform decision record](docs/proposals/issue-244-vertical-crs-geoid-grid.md#rust-crs-and-prepared-point-parity).
 
 Both layers accept `heightOffsetMeters` for a caller-supplied additive
 ellipsoidal-height correction. It defaults to `0` and is applied after

@@ -467,6 +467,20 @@ fn extract_horizontal_axis_directions(wkt: &str) -> Result<Option<[HorizontalAxi
 }
 
 fn parse_axis_direction(axis: &str) -> Result<HorizontalAxisDirection> {
+    let direction = parse_axis_direction_name(axis)?;
+    match direction.as_str() {
+        "east" => Ok(HorizontalAxisDirection::East),
+        "west" => Ok(HorizontalAxisDirection::West),
+        "north" => Ok(HorizontalAxisDirection::North),
+        "south" => Ok(HorizontalAxisDirection::South),
+        _ => Err(CopcError::new(
+            "unsupported-axis",
+            format!("horizontal CRS axis direction {direction:?} is unsupported"),
+        )),
+    }
+}
+
+fn parse_axis_direction_name(axis: &str) -> Result<String> {
     let bytes = axis.as_bytes();
     let mut in_string = false;
     let mut comma = None;
@@ -489,7 +503,7 @@ fn parse_axis_direction(axis: &str) -> Result<HorizontalAxisDirection> {
     let Some(mut start) = comma else {
         return Err(CopcError::new(
             "malformed-wkt",
-            "horizontal CRS axis direction is missing",
+            "CRS axis direction is missing",
         ));
     };
     while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
@@ -502,17 +516,13 @@ fn parse_axis_direction(axis: &str) -> Result<HorizontalAxisDirection> {
     {
         end += 1;
     }
-    let direction = axis[start..end].to_ascii_lowercase();
-    match direction.as_str() {
-        "east" => Ok(HorizontalAxisDirection::East),
-        "west" => Ok(HorizontalAxisDirection::West),
-        "north" => Ok(HorizontalAxisDirection::North),
-        "south" => Ok(HorizontalAxisDirection::South),
-        _ => Err(CopcError::new(
-            "unsupported-axis",
-            format!("horizontal CRS axis direction {direction:?} is unsupported"),
-        )),
+    if end == start {
+        return Err(CopcError::new(
+            "malformed-wkt",
+            "CRS axis direction is missing",
+        ));
     }
+    Ok(axis[start..end].to_ascii_lowercase())
 }
 
 fn parse_axis_order(axis: &str) -> Result<Option<usize>> {
@@ -597,16 +607,162 @@ fn find_direct_sections<'a>(section: &'a str, keyword: &str) -> Vec<&'a str> {
 }
 
 fn extract_vertical_unit_scale(wkt: &str) -> Result<f64> {
-    let Some(section) = find_section(wkt, "VERT_CS[").or_else(|| find_section(wkt, "VERTCRS["))
-    else {
-        return Ok(1.0);
-    };
+    if let Some(section) = find_section(wkt, "VERT_CS[").or_else(|| find_section(wkt, "VERTCRS[")) {
+        validate_vertical_axis_directions(section)?;
+        return vertical_section_unit_scale(section);
+    }
 
-    let Some(unit) =
-        find_section(section, "UNIT[").or_else(|| find_section(section, "LENGTHUNIT["))
-    else {
+    Ok(extract_3d_height_axis_unit_scale(wkt)?.unwrap_or(1.0))
+}
+
+fn validate_vertical_axis_directions(section: &str) -> Result<()> {
+    for axis in find_direct_sections(section, "AXIS[") {
+        let direction = parse_axis_direction_name(axis)?;
+        if direction != "up" {
+            return Err(CopcError::new(
+                "unsupported-axis",
+                format!(
+                    "vertical CRS axis direction {direction:?} is unsupported; only UP is supported"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn vertical_section_unit_scale(section: &str) -> Result<f64> {
+    let root_units = find_direct_sections(section, "UNIT[")
+        .into_iter()
+        .chain(find_direct_sections(section, "LENGTHUNIT["))
+        .map(parse_linear_unit_scale)
+        .collect::<Result<Vec<_>>>()?;
+    let axes = find_direct_sections(section, "AXIS[");
+    let axis_units = axes
+        .iter()
+        .map(|axis| {
+            let units = find_direct_sections(axis, "UNIT[")
+                .into_iter()
+                .chain(find_direct_sections(axis, "LENGTHUNIT["))
+                .collect::<Vec<_>>();
+            if units.len() > 1 {
+                return Err(CopcError::new(
+                    "malformed-wkt",
+                    "vertical CRS axis declares multiple linear units",
+                ));
+            }
+            units
+                .first()
+                .map(|unit| parse_linear_unit_scale(unit))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if axis_units.iter().any(Option::is_none) && axis_units.iter().any(Option::is_some) {
+        return Err(CopcError::new(
+            "malformed-wkt",
+            "vertical CRS must declare a unit for every axis",
+        ));
+    }
+
+    let mut scales = root_units;
+    scales.extend(axis_units.into_iter().flatten());
+    let Some(first) = scales.first().copied() else {
         return Ok(1.0);
     };
+    if scales
+        .iter()
+        .any(|scale| (scale - first).abs() > 1e-14_f64.max(first.abs() * 1e-12))
+    {
+        return Err(CopcError::new(
+            "invalid-value",
+            "vertical CRS declares conflicting linear units",
+        ));
+    }
+    Ok(first)
+}
+
+fn extract_3d_height_axis_unit_scale(wkt: &str) -> Result<Option<f64>> {
+    let horizontal_section = ["PROJCRS[", "GEOGCRS["]
+        .into_iter()
+        .filter_map(|keyword| {
+            let start = find_keyword(wkt, keyword)?;
+            Some((start, find_section(&wkt[start..], keyword)?))
+        })
+        .min_by_key(|(start, _)| *start)
+        .map(|(_, section)| section);
+    let Some(horizontal_section) = horizontal_section else {
+        return Ok(None);
+    };
+    let Some(coordinate_system) = find_direct_sections(horizontal_section, "CS[")
+        .first()
+        .copied()
+    else {
+        return Ok(None);
+    };
+    let definition = coordinate_system
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(definition, _)| definition);
+    let coordinate_system_type = definition
+        .and_then(|definition| definition.split_once(',').map(|(kind, _)| kind.trim()))
+        .map(|kind| kind.trim_matches('"').to_ascii_lowercase());
+    let dimension = definition
+        .and_then(|definition| definition.split_once(','))
+        .and_then(|(_, dimension)| dimension.trim().parse::<usize>().ok());
+    if dimension != Some(3) {
+        return Ok(None);
+    }
+    let is_projected_crs = find_keyword(horizontal_section, "PROJCRS[") == Some(0);
+    let expected_coordinate_system = if is_projected_crs {
+        "cartesian"
+    } else {
+        "ellipsoidal"
+    };
+    if coordinate_system_type.as_deref() != Some(expected_coordinate_system) {
+        return Err(CopcError::new(
+            "unsupported-crs",
+            "3D WKT declares an unsupported coordinate system type",
+        ));
+    }
+
+    let mut axes = find_direct_sections(horizontal_section, "AXIS[")
+        .into_iter()
+        .enumerate()
+        .map(|(index, axis)| Ok((parse_axis_order(axis)?.unwrap_or(index + 1), axis)))
+        .collect::<Result<Vec<_>>>()?;
+    axes.sort_by_key(|(order, _)| *order);
+    if axes.len() != 3
+        || axes
+            .iter()
+            .enumerate()
+            .any(|(index, (order, _))| *order != index + 1)
+    {
+        return Err(CopcError::new(
+            "unsupported-axis",
+            "3D horizontal CRS must declare three uniquely ordered axes",
+        ));
+    }
+
+    let direction = parse_axis_direction_name(axes[2].1)?;
+    if direction != "up" {
+        return Err(CopcError::new(
+            "unsupported-axis",
+            format!(
+                "3D CRS vertical axis direction {direction:?} is unsupported; only UP is supported"
+            ),
+        ));
+    }
+    let units = find_direct_sections(axes[2].1, "LENGTHUNIT[");
+    if units.len() != 1 {
+        return Err(CopcError::new(
+            "malformed-wkt",
+            "3D CRS UP axis must declare exactly one LENGTHUNIT",
+        ));
+    }
+    Ok(Some(parse_linear_unit_scale(units[0])?))
+}
+
+fn parse_linear_unit_scale(unit: &str) -> Result<f64> {
     let Some(open) = unit.find('[') else {
         return Err(CopcError::new(
             "malformed-wkt",
@@ -614,6 +770,9 @@ fn extract_vertical_unit_scale(wkt: &str) -> Result<f64> {
         ));
     };
     let mut cursor = open + 1;
+    while cursor < unit.len() && unit.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
     if unit.as_bytes().get(cursor) != Some(&b'"') {
         return Err(CopcError::new(
             "malformed-wkt",
@@ -638,6 +797,9 @@ fn extract_vertical_unit_scale(wkt: &str) -> Result<f64> {
         ));
     }
     cursor += 1;
+    while cursor < unit.len() && unit.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
     if unit.as_bytes().get(cursor) != Some(&b',') {
         return Err(CopcError::new(
             "malformed-wkt",
@@ -729,13 +891,14 @@ fn find_keyword(wkt: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CrsTransform, GeographicPoint, HorizontalAxisDirection, extract_horizontal_axis_directions,
-        geographic_to_ecef,
+        CrsTransform, GeographicPoint, HorizontalAxisDirection, extract_3d_height_axis_unit_scale,
+        extract_horizontal_axis_directions, geographic_to_ecef,
     };
 
     const WGS84_GEOGRAPHIC_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+    const WGS84_GEOGRAPHIC_3D_US_FOOT_WKT: &str = "GEOGCRS[\"WGS 84\",DATUM[\"World Geodetic System 1984\",ELLIPSOID[\"WGS 84\",6378137,298.257223563,LENGTHUNIT[\"metre\",1]]],PRIMEM[\"Greenwich\",0,ANGLEUNIT[\"degree\",0.0174532925199433]],CS[ellipsoidal,3],AXIS[\"geodetic latitude (Lat)\",north,ORDER[1],ANGLEUNIT[\"degree\",0.0174532925199433]],AXIS[\"geodetic longitude (Lon)\",east,ORDER[2],ANGLEUNIT[\"degree\",0.0174532925199433]],AXIS[\"ellipsoidal height (h)\",up,ORDER[3],LENGTHUNIT[\"US survey foot\",0.304800609601219]],ID[\"EPSG\",4979]]";
     const UTM_WKT: &str = "PROJCS[\"WGS 84 / UTM zone 11N\",GEOGCS[\"WGS 84\",DATUM[\"WGS84\",SPHEROID[\"WGS84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",-117],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]]";
-    const COMPOUND_UTM_WKT: &str = "COMPD_CS[\"WGS 84 / UTM zone 11N\",PROJCS[\"WGS 84 / UTM zone 11N\",GEOGCS[\"WGS 84\",DATUM[\"WGS84\",SPHEROID[\"WGS84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",-117],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]],VERT_CS[\"height\",VERT_DATUM[\"height\",2005],UNIT[\"US survey foot\",0.304800609601219]]]";
+    const COMPOUND_UTM_WKT: &str = "COMPD_CS[\"WGS 84 / UTM zone 11N\",PROJCS[\"WGS 84 / UTM zone 11N\",GEOGCS[\"WGS 84\",DATUM[\"WGS84\",SPHEROID[\"WGS84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",-117],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]],VERT_CS[\"height\",VERT_DATUM[\"height\",2005],UNIT[\"US survey foot\",0.304800609601219],AXIS[\"Gravity-related height\",UP]]]";
 
     #[test]
     fn transforms_geographic_degrees_and_applies_vertical_units() {
@@ -795,6 +958,67 @@ mod tests {
             .unwrap();
         assert!((point.longitude + 118.33772305286695).abs() < 1e-7);
         assert!((point.height - 545.1945 * 0.304800609601219).abs() < 1e-12);
+    }
+
+    #[test]
+    fn honors_explicit_wkt2_three_dimensional_height_units_and_axis_direction() {
+        let transform = CrsTransform::from_wkt(WGS84_GEOGRAPHIC_3D_US_FOOT_WKT).unwrap();
+        let point = transform
+            .transform_point([45.5231, -122.6784, 100.0])
+            .unwrap();
+        assert!((point.longitude + 122.6784).abs() < 1e-12);
+        assert!((point.latitude - 45.5231).abs() < 1e-12);
+        assert!((point.height - 100.0 * 0.304800609601219).abs() < 1e-12);
+
+        let down_axis_wkt =
+            WGS84_GEOGRAPHIC_3D_US_FOOT_WKT.replace("(h)\",up,ORDER[3]", "(d)\",down,ORDER[3]");
+        assert_eq!(
+            CrsTransform::from_wkt(&down_axis_wkt).unwrap_err().code(),
+            "unsupported-axis"
+        );
+
+        let down_vertical_wkt = COMPOUND_UTM_WKT.replace(
+            "AXIS[\"Gravity-related height\",UP]",
+            "AXIS[\"Depth\",DOWN]",
+        );
+        assert_eq!(
+            CrsTransform::from_wkt(&down_vertical_wkt)
+                .unwrap_err()
+                .code(),
+            "unsupported-axis"
+        );
+    }
+
+    #[test]
+    fn accepts_whitespace_around_wkt2_three_dimensional_height_unit_names() {
+        for spaced_unit_wkt in [
+            WGS84_GEOGRAPHIC_3D_US_FOOT_WKT.replace(
+                "LENGTHUNIT[\"US survey foot\",",
+                "LENGTHUNIT[ \"US survey foot\",",
+            ),
+            WGS84_GEOGRAPHIC_3D_US_FOOT_WKT.replace(
+                "LENGTHUNIT[\"US survey foot\",",
+                "LENGTHUNIT[\"US survey foot\" ,",
+            ),
+        ] {
+            let transform = CrsTransform::from_wkt(&spaced_unit_wkt).unwrap();
+            let point = transform
+                .transform_point([45.5231, -122.6784, 100.0])
+                .unwrap();
+            assert!((point.height - 100.0 * 0.304800609601219).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn recognizes_projected_wkt2_3d_keywords_case_insensitively() {
+        let projected_3d_wkt = "PROJCRS[\"WGS 84 / UTM zone 11N 3D\",CS[Cartesian,3],AXIS[\"Easting\",east,ORDER[1],LENGTHUNIT[\"metre\",1]],AXIS[\"Northing\",north,ORDER[2],LENGTHUNIT[\"metre\",1]],AXIS[\"Ellipsoidal height\",up,ORDER[3],LENGTHUNIT[\"metre\",1]]]";
+        for wkt in [
+            projected_3d_wkt.to_string(),
+            projected_3d_wkt.replacen("PROJCRS", "projcrs", 1),
+            projected_3d_wkt.replacen("PROJCRS", "ProjCRS", 1),
+        ] {
+            assert_eq!(extract_3d_height_axis_unit_scale(&wkt).unwrap(), Some(1.0));
+        }
     }
 
     #[test]

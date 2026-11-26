@@ -250,7 +250,7 @@ test("keeps projected horizontal and ellipsoidal-height axis units independent",
   assert.equal(extractHorizontalUnitScale(projectedMissingHeightUnit), 1);
   assert.throws(
     () => extractVerticalUnitScale(projectedMissingHeightUnit),
-    /projected 3D WKT UP axis does not declare a LENGTHUNIT/u,
+    /3D WKT UP axis does not declare a LENGTHUNIT/u,
   );
   assert.throws(
     () => transformPointBufferToPreparedPointData(
@@ -260,7 +260,7 @@ test("keeps projected horizontal and ellipsoidal-height axis units independent",
         coordinates: new Float64Array([500_000, 5_020_000, 100]),
       },
     ),
-    /projected 3D WKT UP axis does not declare a LENGTHUNIT/u,
+    /3D WKT UP axis does not declare a LENGTHUNIT/u,
   );
   assert.ok(
     resolveCopcCrsMetadata(projectedMissingHeightUnit).reasons.some(
@@ -287,6 +287,53 @@ test("validates the explicit EPSG:4979 ellipsoidal height unit", () => {
   );
   assert.equal(inconsistent.vertical.units.standard, "other");
   assert.ok(inconsistent.reasons.some((reason) => reason.code === "inconsistent-unit-declaration"));
+});
+
+test("applies explicit WKT2 geographic 3D height units and rejects DOWN axes", () => {
+  const geographicFeet = WGS84_3D.replace(
+    'ORDER[3],LENGTHUNIT["metre",1]',
+    'ORDER[3],LENGTHUNIT["US survey foot",0.304800609601219]',
+  );
+  assert.equal(extractVerticalUnitScale(geographicFeet), 0.304800609601219);
+
+  const metadata = {
+    pointCount: 1,
+    bounds: { minX: 44.5, minY: -122.5, minZ: 100, maxX: 44.5, maxY: -122.5, maxZ: 100 },
+    cube: { minX: 44.5, minY: -122.5, minZ: 100, maxX: 44.5, maxY: -122.5, maxZ: 100 },
+    wkt: geographicFeet,
+  };
+  const prepared = transformPointBufferToPreparedPointData(metadata, {
+    pointCount: 1,
+    coordinates: new Float64Array([44.5, -122.5, 100]),
+  });
+  assert.deepEqual([...prepared.source.coordinates], [44.5, -122.5, 100]);
+  assert.ok(Math.abs(prepared.geographic.coordinates[2] - 30.4800609601219) < 1e-9);
+
+  const geographicDown = geographicFeet.replace(
+    '"ellipsoidal height (h)",up',
+    '"depth (d)",down',
+  );
+  assert.throws(
+    () => extractVerticalUnitScale(geographicDown),
+    /DOWN axis is unsupported because depth sign normalization is not available/u,
+  );
+  assert.throws(
+    () => extractVerticalUnitScale(
+      WKT2_COMPOUND.replace(
+        '"gravity-related height (H)",up',
+        '"depth (d)",down',
+      ),
+    ),
+    /DOWN axis is unsupported because depth sign normalization is not available/u,
+  );
+  const wkt1Down = UNKNOWN_LOCAL_VERTICAL.replace(
+    'UNIT["metre",1]]',
+    'UNIT["metre",1],AXIS["Depth",DOWN]]',
+  );
+  assert.throws(
+    () => extractVerticalUnitScale(wkt1Down),
+    /DOWN axis is unsupported because depth sign normalization is not available/u,
+  );
 });
 
 test("records WKT2 format even when a recognized root syntax is unsupported", () => {
