@@ -409,6 +409,14 @@ async function probeRustAttributes() {
 }
 
 window.__PACKED_CONSUMER__ = {
+  unloadSource() {
+    layer.unload();
+    return layer.getSnapshot();
+  },
+  async reloadSource() {
+    await layer.reload();
+    return layer.getSnapshot();
+  },
   async compareUrlAndFile(file) {
     const backend = new CopcJsBackend();
     const [urlSource, fileSource] = await Promise.all([

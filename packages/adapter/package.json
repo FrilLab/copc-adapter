@@ -58,6 +58,8 @@
     "test": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs",
     "test:raw": "node scripts/run-tests.mjs",
     "test:file": "node scripts/run-tests.mjs --single",
+    "test:rust-only": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs test/core/copc/backend/rust-only-golden.test.mjs test/core/copc/backend/rust-only-public-contract.test.mjs",
+    "test:rust-only:remote": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs --rust-only-remote test/core/copc/backend/rust-only-golden.test.mjs test/core/copc/backend/rust-only-public-contract.test.mjs",
     "test:conformance:unit": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs --skip-integration test/core/copc/backend/conformance.test.mjs",
     "test:conformance:integration": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs test/core/copc/backend/conformance.test.mjs",
     "coverage": "npm run prepare-copc-adapter-wasm && node scripts/run-tests.mjs --coverage",

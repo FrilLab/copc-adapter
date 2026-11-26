@@ -284,6 +284,50 @@ test("validates the packed Rust backend in an external Vite consumer", async ({
   ).toBe(false);
 });
 
+test("packed Rust/WASM runs without Workers and survives source unload/reload", async ({
+  page,
+}) => {
+  const pageErrors = [];
+  const consoleErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  const { assetResponses } = await loadRustPage(page);
+  const initial = await completedState(page);
+  expect(initial.worker?.completedCount).toBeGreaterThan(0);
+  expect(
+    assetResponses.some(
+      ({ url, status }) => url.includes("copc_adapter_wasm") && status === 200,
+    ),
+  ).toBe(true);
+  await page.evaluate(() => window.__PACKED_CONSUMER__.unloadSource());
+  await expect
+    .poll(async () => (await state(page)).lifecycle)
+    .toBe("mounted");
+  await expect.poll(async () => (await state(page)).renderedPointCount).toBe(0);
+  expect((await state(page)).metadata).toBeUndefined();
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "Worker", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  await page.evaluate(() => window.__PACKED_CONSUMER__.reloadSource());
+  await expect
+    .poll(() => state(page))
+    .toMatchObject({ lifecycle: "ready", backend: "rust" });
+  await expect
+    .poll(async () => (await state(page)).renderedPointCount)
+    .toBeGreaterThan(0);
+  const reloaded = await completedState(page);
+  expect(reloaded.worker).toBeUndefined();
+  expect(reloaded.lastError).toBeUndefined();
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
 test("packed Cesium required mode retains requested attributes and rejects unavailable restyles", async ({
   page,
 }) => {
