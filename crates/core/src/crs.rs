@@ -712,7 +712,8 @@ fn extract_3d_height_axis_unit_scale(wkt: &str) -> Result<Option<f64>> {
     if dimension != Some(3) {
         return Ok(None);
     }
-    let expected_coordinate_system = if horizontal_section.starts_with("PROJCRS") {
+    let is_projected_crs = find_keyword(horizontal_section, "PROJCRS[") == Some(0);
+    let expected_coordinate_system = if is_projected_crs {
         "cartesian"
     } else {
         "ellipsoidal"
@@ -890,8 +891,8 @@ fn find_keyword(wkt: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CrsTransform, GeographicPoint, HorizontalAxisDirection, extract_horizontal_axis_directions,
-        geographic_to_ecef,
+        CrsTransform, GeographicPoint, HorizontalAxisDirection, extract_3d_height_axis_unit_scale,
+        extract_horizontal_axis_directions, geographic_to_ecef,
     };
 
     const WGS84_GEOGRAPHIC_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
@@ -1005,6 +1006,18 @@ mod tests {
                 .transform_point([45.5231, -122.6784, 100.0])
                 .unwrap();
             assert!((point.height - 100.0 * 0.304800609601219).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn recognizes_projected_wkt2_3d_keywords_case_insensitively() {
+        let projected_3d_wkt = "PROJCRS[\"WGS 84 / UTM zone 11N 3D\",CS[Cartesian,3],AXIS[\"Easting\",east,ORDER[1],LENGTHUNIT[\"metre\",1]],AXIS[\"Northing\",north,ORDER[2],LENGTHUNIT[\"metre\",1]],AXIS[\"Ellipsoidal height\",up,ORDER[3],LENGTHUNIT[\"metre\",1]]]";
+        for wkt in [
+            projected_3d_wkt.to_string(),
+            projected_3d_wkt.replacen("PROJCRS", "projcrs", 1),
+            projected_3d_wkt.replacen("PROJCRS", "ProjCRS", 1),
+        ] {
+            assert_eq!(extract_3d_height_axis_unit_scale(&wkt).unwrap(), Some(1.0));
         }
     }
 
