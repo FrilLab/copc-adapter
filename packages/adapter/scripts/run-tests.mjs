@@ -14,6 +14,7 @@ const testPaths = [];
 let collectCoverage = false;
 let skipIntegration = false;
 let requireSingleFile = false;
+let enableRustOnlyRemoteProbe = false;
 
 for (const argument of argumentsList) {
   if (argument === '--coverage') {
@@ -22,6 +23,8 @@ for (const argument of argumentsList) {
     skipIntegration = true;
   } else if (argument === '--single') {
     requireSingleFile = true;
+  } else if (argument === '--rust-only-remote') {
+    enableRustOnlyRemoteProbe = true;
   } else if (argument !== '--') {
     testPaths.push(argument);
   }
@@ -88,6 +91,7 @@ nodeArguments.push(...files.map((file) => path.relative(packageDirectory, file))
 
 const environment = { ...process.env };
 if (skipIntegration) environment.CONFORMANCE_SKIP_INTEGRATION = '1';
+if (enableRustOnlyRemoteProbe) environment.COPC_RUST_ONLY_REMOTE = '1';
 
 const result = spawnSync(process.execPath, nodeArguments, {
   cwd: packageDirectory,

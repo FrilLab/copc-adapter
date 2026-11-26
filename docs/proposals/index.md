@@ -15,5 +15,6 @@ document; unresolved limitations remain documented on the linked page.
 
 ## Research
 
+- [Issue #468: Rust-only COPC readiness and release gates](issue-468-rust-only-readiness.md) — evidence and CI gates prepared; maintainer GO/NO-GO review remains open.
 - [Issue #328: Cesium imagery-projected point color](issue-328-cesium-imagery-colorization.md) — technical feasibility was shown; provider rights remain unresolved.
 - [Issue #404: Dataset-relative and height-above-ground color semantics](issue-404-relative-and-hag-color-semantics.md) — research recommendation awaiting maintainer review.
